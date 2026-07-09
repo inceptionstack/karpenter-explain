@@ -44,6 +44,10 @@ import subprocess
 import sys
 from datetime import datetime, timezone, timedelta
 
+# Alpha. Patch number is auto-bumped to 0.1.<commits-on-main> by the
+# pre-commit hook in .githooks (enable once: git config core.hooksPath .githooks)
+__version__ = "0.1.16"
+
 STORE_ROOT = os.environ.get("KEXPLAIN_STORE", os.path.expanduser("~/.kexplain"))
 KARPENTER_NS = os.environ.get("KARPENTER_NAMESPACE", "kube-system")
 
@@ -136,7 +140,8 @@ def print_logo(subtitle=""):
         "      ▌"
     )
     print(cyan(art))
-    print(dim(f"  an EXPLAIN plan for Karpenter{('  |  ' + subtitle) if subtitle else ''}\n"))
+    print(dim(f"  an EXPLAIN plan for Karpenter  v{__version__} (alpha)"
+              f"{('  |  ' + subtitle) if subtitle else ''}\n"))
 
 def status(msg=None):
     """Transient one-line progress message; each call replaces the previous
@@ -1821,6 +1826,8 @@ def main():
     global USE_COLOR
     ap = argparse.ArgumentParser(prog="kexplain",
                                  description="EXPLAIN plan for Karpenter decisions")
+    ap.add_argument("--version", action="version",
+                    version=f"kexplain {__version__} (alpha)")
     ap.add_argument("--no-color", action="store_true")
     ap.add_argument("--no-sync", action="store_true",
                     help="skip harvesting cluster state before running")

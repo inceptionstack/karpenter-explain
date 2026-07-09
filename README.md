@@ -63,8 +63,12 @@ pip install --user .
 Then:
 
 ```bash
+kexplain --version               # kexplain 0.1.x (alpha)
 kexplain doctor                  # checks everything and tells you what to fix
 ```
+
+kexplain is alpha software; the version is also shown in the banner on
+every interactive run.
 
 `doctor` verifies kubectl, cluster access, Karpenter, NodePools, debug
 logging, AWS access, and the local store, with a fix hint for anything

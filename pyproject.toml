@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kexplain"
-version = "0.1.0"
+dynamic = ["version"]
 description = "An EXPLAIN plan for Karpenter: trace why each node was provisioned"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -27,3 +27,6 @@ kexplain = "kexplain:main"
 
 [tool.setuptools]
 py-modules = ["kexplain"]
+
+[tool.setuptools.dynamic]
+version = { attr = "kexplain.__version__" }

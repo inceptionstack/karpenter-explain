@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Auto-bump the version to 0.1.<commit-count> on each commit to main.
+# Enable once per clone:  git config core.hooksPath .githooks
+set -euo pipefail
+
+branch=$(git symbolic-ref --short HEAD 2>/dev/null || echo "")
+[ "$branch" = "main" ] || exit 0
+
+# count includes the commit being created
+count=$(($(git rev-list --count HEAD) + 1))
+new="0.1.${count}"
+
+current=$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' kexplain.py)
+[ "$current" = "$new" ] && exit 0
+
+sed -i.bak "s/^__version__ = \".*\"$/__version__ = \"${new}\"/" kexplain.py
+rm -f kexplain.py.bak
+git add kexplain.py
+echo "version bumped: ${current} -> ${new}"

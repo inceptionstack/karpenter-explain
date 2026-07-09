@@ -86,6 +86,10 @@ explicitly asking.
 
 ## Development
 
+- Version: `__version__` in kexplain.py is the single source of truth
+  (pyproject reads it dynamically). It auto-bumps to 0.1.<commit-count> via
+  the pre-commit hook in .githooks; enable once per clone with
+  `git config core.hooksPath .githooks`. Do not bump it by hand.
 - Code lives in the single `kexplain.py` file, organized by section markers
   (`# --- store`, `# --- decision model`, `# --- commands`, ...).
 - Tests: `python3 -m unittest discover tests`. They run offline against
