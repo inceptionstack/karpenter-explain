@@ -1,2 +1,0 @@
-[console_scripts]
-kexplain = kexplain:main

@@ -20,3 +20,8 @@ __pycache__/
 *.pem
 *.key
 .env
+
+# python packaging artifacts
+build/
+dist/
+*.egg-info/
