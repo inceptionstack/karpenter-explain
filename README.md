@@ -27,6 +27,7 @@ kexplain history              # timeline of every provisioning/disruption decisi
 kexplain history --since 2    # last 2 hours
 kexplain explain <node>       # full decision trace (node, nodeclaim, or instance id)
 kexplain explain <node> --json
+kexplain explain <node> --why-not c5.medium   # why wasn't THIS type chosen?
 kexplain plan -f pod.yaml     # BEFORE the fact: which instance types could this pod get
 kexplain sync                 # just harvest (any other command auto-syncs first)
 ```
@@ -61,6 +62,32 @@ The FEATURE ATTRIBUTION section answers the classic "why do I keep getting
 expensive NVMe / high-network / latest-gen instances I never asked for?" —
 it distinguishes *your constraints demanded it* from *CreateFleet chose it*
 (price-capacity-optimized weighs interruption risk, not just price, for spot).
+
+## `--why-not`: interrogate a single type
+
+```
+$ kexplain explain my-node --why-not c8g.xlarge
+
+WHY NOT c8g.xlarge for ip-192-168-43-145.ec2.internal (chosen: m5d.xlarge)?
+
+  ✗ ELIMINATED by 3 rule(s) before reaching CreateFleet:
+
+    ✗ rule: karpenter.k8s.aws/instance-local-nvme >= 101   (pod constraints)
+      c8g.xlarge has: 0 GB
+
+    ✗ rule: karpenter.k8s.aws/instance-cpu-manufacturer = intel   (pod constraints)
+      c8g.xlarge has: aws
+
+    ✗ rule: resource fit for pending pods   (aggregated requests)
+      insufficient memory: 8.0 GiB (~6.8 allocatable) < 8448Mi requested
+```
+
+Every rule is checked independently, so you see *all* the reasons, each with
+its provenance (NodePool vs pod constraint) and the type's actual value. If
+the type passed everything, kexplain says so — it was in the candidate set —
+and explains the CreateFleet-level reason instead (lowest-price comparison for
+on-demand, pool depth/price for spot, with live spot prices). Family names
+and typos get suggestions.
 
 This mirrors Karpenter's actual pipeline: pending pods → scheduling simulation
 → requirement intersection → instance-type filtering (price-ordered) →

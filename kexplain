@@ -696,6 +696,126 @@ def render_funnel(stages, s, L):
                      f'CreateFleet picks: {green(bold(s.instance_type))} '
                      f'({s.capacity_type}, {s.zone})'))
 
+def collect_constraints(s, pool):
+    """The full constraint list applied to this nodeclaim, with provenance.
+    Returns [(source, requirement-dict)]."""
+    out = []
+    pool_reqs = {}
+    if pool:
+        for r in pool["spec"]["template"]["spec"].get("requirements", []):
+            if r["key"] == "kubernetes.io/os":
+                continue
+            pool_reqs[r["key"]] = r
+            out.append((f'NodePool {pool["metadata"]["name"]}', r))
+    for r in (s.raw_claim or {}).get("spec", {}).get("requirements", []):
+        key = r["key"]
+        if key in ("karpenter.sh/nodepool", "karpenter.k8s.aws/ec2nodeclass",
+                   "kubernetes.io/os", "node.kubernetes.io/instance-type",
+                   "topology.kubernetes.io/zone"):
+            continue
+        pr = pool_reqs.get(key)
+        if pr and pr.get("operator") == r.get("operator") and \
+           sorted(pr.get("values", [])) == sorted(r.get("values", [])):
+            continue
+        out.append(("pod constraints", r))
+    return out
+
+def cmd_why_not(store, s, pool, itype):
+    """Explain why `itype` was not chosen for nodeclaim `s`."""
+    cat = ec2_catalog(store)
+    chosen = s.instance_type or "?"
+    print(bold(f'\nWHY NOT {itype} for {s.node or s.name} '
+               f'(chosen: {chosen})?\n'))
+
+    info = cat.get(itype)
+    if info is None:
+        # maybe it's a family or a typo
+        fam_matches = sorted(n for n in cat if n.split(".")[0] == itype)[:8]
+        if fam_matches:
+            print(f'  "{itype}" is a family, not a type. Try one of: '
+                  f'{", ".join(fam_matches)}')
+        else:
+            close = sorted(n for n in cat if itype.split(".")[0][:2] in n)[:6]
+            print(red(f'  ✗ {itype} does not exist in this region\'s EC2 catalog'))
+            if close:
+                print(dim(f'    similar available types: {", ".join(close)}'))
+        return
+
+    constraints = collect_constraints(s, pool)
+    failures = []
+    for source, r in constraints:
+        if not match_requirement(info, r):
+            failures.append((source, r))
+
+    # resource fit check
+    fit_fail = None
+    reqs = s.requests if isinstance(s.requests, dict) else None
+    if reqs:
+        cpu = parse_quantity(reqs.get("cpu", 0))
+        mem = parse_quantity(reqs.get("memory", 0))
+        if cpu and info["cpu"] * 0.9 < cpu:
+            fit_fail = (f'insufficient cpu: {info["cpu"]} vCPU (~{info["cpu"] * 0.9:.1f} '
+                        f'allocatable) < {reqs.get("cpu")} requested')
+        elif mem and info["memory_mib"] * 2**20 * 0.85 < mem:
+            fit_fail = (f'insufficient memory: {info["memory_mib"] / 1024:.1f} GiB '
+                        f'(~{info["memory_mib"] * 0.85 / 1024:.1f} allocatable) '
+                        f'< {reqs.get("memory")} requested')
+
+    if failures or fit_fail:
+        n = len(failures) + (1 if fit_fail else 0)
+        print(red(f'  ✗ ELIMINATED by {n} rule(s) before reaching CreateFleet:\n'))
+        for source, r in failures:
+            actual = {
+                "kubernetes.io/arch": info["arch"],
+                "karpenter.sh/capacity-type":
+                    "/".join(x for x, ok in (("spot", info["spot"]), ("on-demand", info["od"])) if ok),
+                "karpenter.k8s.aws/instance-category": info["category"],
+                "karpenter.k8s.aws/instance-family": info["family"],
+                "karpenter.k8s.aws/instance-generation": info["generation"],
+                "karpenter.k8s.aws/instance-cpu": info["cpu"],
+                "karpenter.k8s.aws/instance-memory": info["memory_mib"],
+                "karpenter.k8s.aws/instance-size": info["size"],
+                "karpenter.k8s.aws/instance-local-nvme": f'{info["nvme_gb"]} GB',
+                "karpenter.k8s.aws/instance-cpu-manufacturer": info["manufacturer"],
+                "karpenter.k8s.aws/instance-network-bandwidth": f'{info["bandwidth_mbps"]} Mbps',
+            }.get(r["key"], "?")
+            print(f'    {red("✗")} rule: {bold(requirement_str(r))}   {dim("(" + source + ")")}')
+            print(f'      {itype} has: {yellow(str(actual))}\n')
+        if fit_fail:
+            print(f'    {red("✗")} rule: resource fit for pending pods   {dim("(aggregated requests)")}')
+            print(f'      {yellow(fit_fail)}\n')
+        return
+
+    # survived all constraints — so it WAS a candidate
+    print(green(f'  ✓ {itype} passed every constraint — it WAS in the candidate set '
+                f'sent to CreateFleet'))
+    cap = s.capacity_type or "on-demand"
+    print(f'\n  CreateFleet chose {bold(chosen)} over it. Why:')
+    if cap == "spot":
+        p_it = spot_price(itype, s.zone) if s.zone else None
+        p_ch = spot_price(chosen, s.zone) if s.zone else None
+        cmp_txt = ""
+        if p_it and p_ch:
+            cmp_txt = (f'\n    current spot: {itype} ~${p_it:.4f}/hr vs '
+                       f'{chosen} ~${p_ch:.4f}/hr')
+        print(f'    allocation strategy is price-capacity-optimized: EC2 ranks each\n'
+              f'    (type, zone) spot pool by price AND depth/interruption risk.\n'
+              f'    {itype} either priced higher or sat in a shallower pool at launch.'
+              f'{cmp_txt}')
+    else:
+        ch_info = cat.get(chosen)
+        if ch_info and (info["cpu"], info["memory_mib"]) > (ch_info["cpu"], ch_info["memory_mib"]):
+            print(f'    allocation strategy is lowest-price: {chosen} '
+                  f'({ch_info["cpu"]} vCPU/{ch_info["memory_mib"] / 1024:.0f} GiB) was smaller/cheaper\n'
+                  f'    than {itype} ({info["cpu"]} vCPU/{info["memory_mib"] / 1024:.0f} GiB) '
+                  f'while still fitting the pods.')
+        else:
+            print(f'    allocation strategy is lowest-price across the candidate set;\n'
+                  f'    {chosen} priced lower in {s.zone or "the chosen zone"} at launch time.')
+    print(dim(f'\n  note: zone offerings and AMI compatibility are also filtered at '
+              f'runtime;\n  a type absent from {s.zone or "the zone"} would be dropped '
+              f'even if it passes all rules.'))
+
 def cmd_explain(store, args):
     stories = build_stories(store)
     s = resolve_target(stories, args.target)
@@ -707,6 +827,11 @@ def cmd_explain(store, args):
         print(json.dumps({k: (fmt_ts(v) if isinstance(v, datetime) else v)
                           for k, v in vars(s).items() if k != "raw_claim"},
                          indent=2, default=str))
+        return
+
+    if args.why_not:
+        pool = store.objects("nodepools").get(s.nodepool or "")
+        cmd_why_not(store, s, pool, args.why_not)
         return
 
     live = s.name in live_nodeclaims()
@@ -1171,6 +1296,8 @@ def main():
     p.add_argument("--json", action="store_true")
     p.add_argument("--no-prices", action="store_true", help="skip spot price lookup")
     p.add_argument("--no-funnel", action="store_true", help="skip the constraint funnel view")
+    p.add_argument("--why-not", metavar="INSTANCE_TYPE",
+                   help="explain why this instance type was not chosen for the node")
 
     p = sub.add_parser("plan", help="before-the-fact: which instance types could a pod get")
     p.add_argument("-f", "--file", required=True, help="pod/deployment yaml or json")
