@@ -94,4 +94,5 @@ explicitly asking.
   (docs, comments, output strings), plain direct prose, and commit messages
   carry no AI attribution of any kind.
 - Before pushing: `python3 -m unittest discover tests` must pass and
-  `grep -rn "—" $(git ls-files)` must come back empty.
+  `grep -rnP '\x{2014}' $(git ls-files)` (the em-dash gate) must come back
+  empty. CI enforces both.
