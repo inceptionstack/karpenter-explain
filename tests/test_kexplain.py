@@ -128,6 +128,47 @@ class TestParsing(unittest.TestCase):
         self.assertEqual(f["generation"], 8)
         self.assertNotIn("d", f["suffix"])
 
+    def test_instance_features_multi_suffix(self):
+        # x2iedn: intel (dropped), extra, nvme, network
+        f = kx.instance_features("x2iedn.2xlarge")
+        self.assertEqual(f["suffix"], "edn")
+        self.assertIn("local NVMe instance storage", f["capabilities"])
+        self.assertIn("network and EBS optimized", f["capabilities"])
+        f = kx.instance_features("m5zn.large")
+        self.assertEqual(f["suffix"], "zn")
+        self.assertIn("high CPU frequency", f["capabilities"])
+
+    def test_instance_features_variants_and_odd_families(self):
+        f = kx.instance_features("c7i-flex.large")
+        self.assertEqual((f["generation"], f["variant"]), (7, "flex"))
+        f = kx.instance_features("p6-b200.48xlarge")
+        self.assertEqual((f["generation"], f["variant"]), (6, "b200"))
+        # families with no generation digit parse without crashing
+        f = kx.instance_features("u-6tb1.112xlarge")
+        self.assertEqual(f["generation"], 0)
+        f = kx.instance_features("mac-m4.metal")
+        self.assertEqual(f["generation"], 0)
+
+    def test_premium_features_unknown_without_claim_spec(self):
+        s = kx.NodeStory("nc")
+        s.instance_type = "m5d.xlarge"
+        s.raw_claim = None  # store never captured the nodeclaim
+        premium = kx._premium_features(s)
+        self.assertTrue(premium)
+        for label, required in premium:
+            self.assertIsNone(required,
+                              f"{label}: must be unknown, not asserted")
+
+    def test_premium_features_attributed_with_claim_spec(self):
+        s = kx.NodeStory("nc")
+        s.instance_type = "m5d.xlarge"
+        s.raw_claim = {"spec": {"requirements": [
+            {"key": "karpenter.k8s.aws/instance-local-nvme",
+             "operator": "Gte", "values": ["100"]},
+        ]}}
+        premium = dict(kx._premium_features(s))
+        self.assertTrue(premium["local NVMe instance storage ('d' variant)"])
+
     def test_instance_id(self):
         self.assertEqual(kx.instance_id("aws:///us-east-1b/i-0abc"), "i-0abc")
         self.assertIsNone(kx.instance_id(None))

@@ -339,6 +339,13 @@ class NodeStory:
         self.replaces = None                 # dict: this node replaced others via consolidation
         self.raw_claim = None
 
+    @property
+    def has_claim_spec(self):
+        """True when the store captured the NodeClaim object itself. Without
+        it we know WHAT launched (from logs) but not the resolved
+        requirements, so pod-constraint attribution is impossible."""
+        return bool(self.raw_claim)
+
 def _nodeclaim_name(row):
     nc = row.get("NodeClaim")
     return nc.get("name") if isinstance(nc, dict) else nc
@@ -506,14 +513,41 @@ def live_nodeclaims():
 def instance_id(provider_id):
     return provider_id.rsplit("/", 1)[-1] if provider_id else None
 
+# AWS instance name suffix letters (the part after the generation digit)
+# and what each one means. Processor letters are informational; the rest
+# mark capability variants. Source: AWS EC2 instance type naming convention.
+SUFFIX_MEANINGS = {
+    "a": "AMD processor",
+    "g": "AWS Graviton processor",
+    "i": "Intel processor",
+    "d": "local NVMe instance storage",
+    "n": "network and EBS optimized",
+    "e": "extra storage or memory",
+    "z": "high CPU frequency",
+    "b": "block storage (EBS) optimized",
+    "q": "Qualcomm inference accelerator",
+    "f": "fractional GPU or flex",
+}
+PROCESSOR_SUFFIXES = frozenset("agi")
+
 def instance_features(itype):
-    """Decode an instance type name: family, generation, feature suffixes."""
+    """Decode an instance type name per the AWS naming convention:
+    family letters, generation digit(s), capability suffix letters, and an
+    optional -variant (flex, b200, 3tb1, m4pro, ...). Handles the odd
+    families too: mac-m4, u-6tb1, c7i-flex, p6-b200, gr6f."""
     fam = itype.split(".")[0]
-    m = re.match(r"([a-z]+)(\d+)([a-z-]*)", fam)
+    base, _, variant = fam.partition("-")
+    m = re.match(r"([a-z]+?)(\d+)([a-z]*)$", base)
     if not m:
-        return {"family": fam, "generation": 0, "suffix": ""}
+        # no generation digit at all (e.g. "mac" in mac-m4, "u" in u-3tb1)
+        return {"family": fam, "generation": 0, "suffix": "", "variant": variant,
+                "capabilities": []}
+    suffix = m.group(3)
+    caps = [SUFFIX_MEANINGS[ch] for ch in suffix
+            if ch not in PROCESSOR_SUFFIXES and ch in SUFFIX_MEANINGS]
     return {"family": fam, "generation": int(m.group(2)),
-            "suffix": m.group(3).replace("g", "").replace("a", "").replace("i", "")}
+            "suffix": "".join(ch for ch in suffix if ch not in PROCESSOR_SUFFIXES),
+            "variant": variant, "capabilities": caps}
 
 # ---------------------------------------------------------------- pricing (best effort)
 
@@ -829,6 +863,10 @@ def cmd_why_not(store, s, pool, itype):
                 print(dim(f'    similar available types: {", ".join(close)}'))
         return
 
+    if not s.has_claim_spec:
+        print(yellow('  note: the NodeClaim spec is missing from the store, so only '
+                     'NodePool rules\n  can be checked; pod-injected constraints are '
+                     'invisible here.\n'))
     constraints = collect_constraints(s, pool)
     failures = []
     for source, r in constraints:
@@ -911,6 +949,11 @@ def _section_header(s, live):
              f'{dim("nodeclaim=" + s.name)}  [{state}]')]
     if s.provider_id:
         L.append((0, dim(f'     {s.provider_id}')))
+    if not s.has_claim_spec:
+        L.append((0, yellow('     partial data: the NodeClaim was deleted before this '
+                            'store captured it.')))
+        L.append((0, yellow('     Constraint attribution below is limited to what the '
+                            'logs recorded; cron `kexplain sync` to avoid this.')))
     return L
 
 MAX_TRIGGER_PODS_SHOWN = 8
@@ -1031,44 +1074,80 @@ def _section_launch(s, args):
         L.append((2, dim(f'allocatable: {alloc}')))
     return L
 
-# instance-name suffixes and generation threshold that mark premium hardware
-NVME_SUFFIX = "d"
-NETWORK_SUFFIX = "n"
+# generation at or above which we flag "latest generation" as premium
 LATEST_GEN_THRESHOLD = 7
 
-def _section_features(s):
-    """Premium features of the chosen type: required by a constraint, or
-    just what CreateFleet picked?"""
+# Which karpenter requirement key demands each capability suffix. Suffixes
+# without a matching key (z, e, b, q, f) can only be pinned via
+# instance-family/instance-type requirements, so we check those instead.
+SUFFIX_REQ_KEYS = {
+    "d": "karpenter.k8s.aws/instance-local-nvme",
+    "n": "karpenter.k8s.aws/instance-network-bandwidth",
+}
+
+def _premium_features(s):
+    """Premium features of the chosen type as (label, required?) pairs.
+    required? is None when the claim spec is missing from the store, i.e.
+    we cannot know whether a constraint demanded the feature."""
     feats = instance_features(s.instance_type)
     claim_reqs = (s.raw_claim or {}).get("spec", {}).get("requirements", [])
     req_keys = {r["key"] for r in claim_reqs}
+    known = s.has_claim_spec
+
+    def attributed(required):
+        return required if known else None
+
+    # a family/type pin in the claim covers ANY suffix of the pinned family
+    family_pinned = any(
+        r["key"] in ("karpenter.k8s.aws/instance-family",
+                     "node.kubernetes.io/instance-type")
+        and r.get("operator") == "In"
+        and any(v.split(".")[0] == feats["family"] for v in r.get("values", []))
+        for r in claim_reqs)
+
     premium = []
-    if NVME_SUFFIX in feats["suffix"]:
-        premium.append(("local NVMe storage ('d' variant)",
-                        "karpenter.k8s.aws/instance-local-nvme" in req_keys))
-    if NETWORK_SUFFIX in feats["suffix"]:
-        premium.append(("enhanced networking ('n' variant)",
-                        "karpenter.k8s.aws/instance-network-bandwidth" in req_keys))
+    for ch in feats["suffix"]:
+        meaning = SUFFIX_MEANINGS.get(ch)
+        if not meaning:
+            continue
+        label = f"{meaning} ('{ch}' variant)"
+        specific_key = SUFFIX_REQ_KEYS.get(ch)
+        required = (specific_key in req_keys if specific_key else False) or family_pinned
+        premium.append((label, attributed(required)))
     if feats["generation"] >= LATEST_GEN_THRESHOLD:
         gen_req = any(r["key"] == "karpenter.k8s.aws/instance-generation" and
                       r.get("operator") in ("Gt", "Gte") and
                       r.get("values") and float(r["values"][0]) >= LATEST_GEN_THRESHOLD - 1
                       for r in claim_reqs)
-        premium.append((f'latest generation (gen {feats["generation"]})', gen_req))
+        premium.append((f'latest generation (gen {feats["generation"]})',
+                        attributed(gen_req or family_pinned)))
+    return premium
+
+def _section_features(s):
+    """Premium features of the chosen type: required by a constraint, just
+    what CreateFleet picked, or unknown when the claim spec is gone?"""
+    premium = _premium_features(s)
     if not premium:
         return []
     L = [(1, bold("FEATURE ATTRIBUTION") + dim("  (premium features of the chosen type)"))]
     for label, required in premium:
-        if required:
+        if required is None:
+            L.append((2, f'{label}: {yellow("attribution unknown")}. The NodeClaim '
+                         f'spec was deleted before this store saw it, so pod '
+                         f'constraints cannot be checked'))
+        elif required:
             L.append((2, f'{label}: {green("explicitly required")} by a scheduling constraint'))
         else:
             L.append((2, f'{label}: {yellow("NOT required by any constraint")}. '
                          f'CreateFleet picked it from the {s.candidate_count or "?"}-type '
                          f'candidate set ({"interruption-risk weighting" if s.capacity_type == "spot" else "it priced lowest at launch"})'))
-    if any(not req for _, req in premium):
+    if any(req is False for _, req in premium):
         L.append((2, dim('to prevent: add NodePool requirements, e.g. '
                          'instance-local-nvme DoesNotExist, instance-generation Lt N, '
                          'or instance-family NotIn [...]')))
+    if any(req is None for _, req in premium):
+        L.append((2, dim('to keep future nodes explainable, cron `kexplain sync` '
+                         '(see "Keeping history" in the readme)')))
     return L
 
 def _section_lifecycle(s):
