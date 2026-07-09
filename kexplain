@@ -1,0 +1,1194 @@
+#!/usr/bin/env python3
+"""
+kexplain — an EXPLAIN plan for Karpenter.
+
+Reconstructs, per node, how Karpenter reached its provisioning decision:
+which pending pods triggered it, what constraints were in play, which
+instance types were candidates, what CreateFleet actually chose, the node
+lifecycle, and any later disruption (consolidation/drift/expiry).
+
+Data sources (harvested into a local store on every run, because they are
+ephemeral in the cluster):
+  * karpenter controller JSON logs (debug level)
+  * NodeClaim / NodePool / EC2NodeClass / Node objects
+  * kubernetes events (Nominated, DisruptionBlocked, ...)
+
+Commands:
+  kexplain sync                harvest cluster state into the local store
+  kexplain nodes               list karpenter-managed nodes (live + historical)
+  kexplain history             timeline of provisioning & disruption decisions
+  kexplain explain <node>      full decision trace for a node / nodeclaim
+  kexplain plan -f pod.yaml    before-the-fact: candidate instance types for a pod
+"""
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+from collections import defaultdict
+from datetime import datetime, timezone, timedelta
+
+STORE_ROOT = os.environ.get("KEXPLAIN_STORE", os.path.expanduser("~/.kexplain"))
+KARPENTER_NS = os.environ.get("KARPENTER_NAMESPACE", "kube-system")
+
+# ---------------------------------------------------------------- utilities
+
+def sh(cmd, check=True, timeout=120):
+    p = subprocess.run(cmd, shell=isinstance(cmd, str), capture_output=True,
+                       text=True, timeout=timeout)
+    if check and p.returncode != 0:
+        raise RuntimeError(f"command failed: {cmd}\n{p.stderr.strip()}")
+    return p.stdout
+
+def kubectl_json(args):
+    out = sh(f"kubectl {args} -o json")
+    return json.loads(out)
+
+def parse_ts(s):
+    if not s:
+        return None
+    s = s.replace("Z", "+00:00")
+    # trim sub-second precision to 6 digits for fromisoformat
+    m = re.match(r"(.*\.\d{1,6})\d*(\+.*|$)", s)
+    if m:
+        s = m.group(1) + (m.group(2) or "+00:00")
+    try:
+        dt = datetime.fromisoformat(s)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+def fmt_ts(dt):
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ") if dt else "?"
+
+def fmt_dur(seconds):
+    if seconds is None:
+        return "?"
+    seconds = int(seconds)
+    if seconds < 120:
+        return f"{seconds}s"
+    if seconds < 7200:
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+    return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+
+USE_COLOR = sys.stdout.isatty()
+def c(code, s):
+    return f"\033[{code}m{s}\033[0m" if USE_COLOR else str(s)
+def bold(s):    return c("1", s)
+def dim(s):     return c("2", s)
+def green(s):   return c("32", s)
+def yellow(s):  return c("33", s)
+def red(s):     return c("31", s)
+def cyan(s):    return c("36", s)
+def magenta(s): return c("35", s)
+
+# ---------------------------------------------------------------- store
+
+class Store:
+    """Local persistence: logs.jsonl (deduped), object snapshots, events."""
+
+    def __init__(self, cluster):
+        self.dir = os.path.join(STORE_ROOT, cluster)
+        for sub in ("", "nodeclaims", "nodes", "nodepools", "ec2nodeclasses"):
+            os.makedirs(os.path.join(self.dir, sub), exist_ok=True)
+        self.log_path = os.path.join(self.dir, "logs.jsonl")
+        self.events_path = os.path.join(self.dir, "events.jsonl")
+
+    # ---- generic jsonl with dedup by content hash
+    def _load_jsonl(self, path):
+        rows = []
+        if os.path.exists(path):
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            rows.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            pass
+        return rows
+
+    def _append_jsonl(self, path, rows, key_fn):
+        seen = set()
+        for r in self._load_jsonl(path):
+            seen.add(key_fn(r))
+        added = 0
+        with open(path, "a") as f:
+            for r in rows:
+                k = key_fn(r)
+                if k not in seen:
+                    seen.add(k)
+                    f.write(json.dumps(r, separators=(",", ":")) + "\n")
+                    added += 1
+        return added
+
+    @staticmethod
+    def _log_key(r):
+        return hashlib.sha1(json.dumps(
+            [r.get("time"), r.get("message"), r.get("NodeClaim"), r.get("Pods"),
+             r.get("command-id"), r.get("controller")],
+            sort_keys=True).encode()).hexdigest()
+
+    @staticmethod
+    def _event_key(e):
+        return f'{e.get("uid")}:{e.get("count")}:{e.get("lastTimestamp")}'
+
+    def add_logs(self, rows):
+        return self._append_jsonl(self.log_path, rows, self._log_key)
+
+    def add_events(self, rows):
+        return self._append_jsonl(self.events_path, rows, self._event_key)
+
+    def logs(self):
+        rows = self._load_jsonl(self.log_path)
+        rows.sort(key=lambda r: r.get("time") or "")
+        return rows
+
+    def events(self):
+        return self._load_jsonl(self.events_path)
+
+    # ---- object snapshots (latest wins; survive deletion in-cluster)
+    def snapshot(self, kind_dir, obj):
+        name = obj["metadata"]["name"]
+        with open(os.path.join(self.dir, kind_dir, name + ".json"), "w") as f:
+            json.dump(obj, f)
+
+    def objects(self, kind_dir):
+        out = {}
+        d = os.path.join(self.dir, kind_dir)
+        for fn in os.listdir(d):
+            if fn.endswith(".json"):
+                with open(os.path.join(d, fn)) as f:
+                    try:
+                        obj = json.load(f)
+                        out[obj["metadata"]["name"]] = obj
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+        return out
+
+# ---------------------------------------------------------------- sync
+
+def current_cluster():
+    try:
+        ctx = sh("kubectl config current-context").strip()
+    except RuntimeError:
+        sys.exit("error: no kubectl context. Is your kubeconfig set up?")
+    # eksctl contexts look like user@cluster.region.eksctl.io
+    m = re.search(r"@?([\w-]+)\.([\w-]+)\.eksctl\.io", ctx)
+    if m:
+        return m.group(1)
+    m = re.search(r"cluster/([\w-]+)", ctx)
+    return m.group(1) if m else re.sub(r"[^\w.-]", "_", ctx)
+
+def sync(store, quiet=False):
+    def note(msg):
+        if not quiet:
+            print(dim(f"  sync: {msg}"))
+
+    # -- karpenter controller logs (current + previous container)
+    raw = ""
+    for flag in ("", "--previous"):
+        try:
+            raw += sh(f"kubectl logs -n {KARPENTER_NS} "
+                      f"-l app.kubernetes.io/name=karpenter "
+                      f"--all-containers --tail=-1 {flag}", check=False)
+        except Exception:
+            pass
+    rows = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+    note(f"{store.add_logs(rows)} new log lines ({len(rows)} fetched)")
+
+    # -- events from all namespaces (karpenter events land on pods/nodes/nodeclaims)
+    try:
+        evs = kubectl_json("get events -A")["items"]
+        keep = []
+        for e in evs:
+            src = (e.get("source", {}) or {}).get("component", "") or \
+                  e.get("reportingComponent", "")
+            if "karpenter" in src or e.get("reason") in (
+                    "Nominated", "FailedScheduling", "DisruptionBlocked",
+                    "Unconsolidatable", "DisruptionTerminating", "Evicted"):
+                keep.append({
+                    "uid": e["metadata"]["uid"],
+                    "reason": e.get("reason"),
+                    "message": e.get("message"),
+                    "count": e.get("count"),
+                    "kind": e.get("involvedObject", {}).get("kind"),
+                    "name": e.get("involvedObject", {}).get("name"),
+                    "namespace": e.get("involvedObject", {}).get("namespace"),
+                    "lastTimestamp": e.get("lastTimestamp") or
+                                     e.get("eventTime") or
+                                     e.get("firstTimestamp"),
+                    "source": src,
+                })
+        note(f"{store.add_events(keep)} new events")
+    except Exception as ex:
+        note(f"events failed: {ex}")
+
+    # -- object snapshots
+    for kind, kdir in (("nodeclaims", "nodeclaims"), ("nodepools", "nodepools"),
+                       ("ec2nodeclasses", "ec2nodeclasses")):
+        try:
+            for obj in kubectl_json(f"get {kind}")["items"]:
+                obj.pop("managedFields", None)
+                store.snapshot(kdir, obj)
+        except Exception:
+            pass
+    try:
+        for obj in kubectl_json("get nodes")["items"]:
+            obj["metadata"].pop("managedFields", None)
+            store.snapshot("nodes", obj)
+    except Exception:
+        pass
+    note("object snapshots updated")
+
+# ---------------------------------------------------------------- decision model
+
+class NodeStory:
+    """Everything we know about one nodeclaim's life."""
+    def __init__(self, name):
+        self.name = name                     # nodeclaim name
+        self.node = None                     # k8s node name
+        self.nodepool = None
+        self.provider_id = None
+        self.instance_type = None
+        self.zone = None
+        self.capacity_type = None
+        self.allocatable = None
+        self.requests = None                 # aggregated requests at creation
+        self.candidate_types = None          # truncated list from logs
+        self.candidate_count = None
+        self.trigger_pods = []               # [(ns/pod, ...)]
+        self.nominated_pods = []
+        self.t_created = self.t_launched = self.t_registered = None
+        self.t_initialized = self.t_deleted = None
+        self.disruption = None               # dict: reason/decision/replacements/ts
+        self.disruption_blocked = []         # [(ts, message)]
+        self.replaces = None                 # dict: this node replaced others via consolidation
+        self.raw_claim = None
+
+def build_stories(store):
+    """Parse harvested logs + snapshots into per-nodeclaim stories."""
+    stories = {}
+    def get(name):
+        if name not in stories:
+            stories[name] = NodeStory(name)
+        return stories[name]
+
+    logs = store.logs()
+
+    # provisioning sessions: "found provisionable pod(s)" lines, in time order,
+    # matched to the "created nodeclaim" lines that follow them
+    sessions = []  # (ts, pods_str)
+    replace_cmds = []  # (ts, disrupted nodeclaim names, reason, savings)
+    for r in logs:
+        msg = r.get("message", "")
+        ts = parse_ts(r.get("time"))
+        ncn = r.get("NodeClaim", {}).get("name") if isinstance(r.get("NodeClaim"), dict) \
+              else r.get("NodeClaim")
+
+        if msg == "found provisionable pod(s)":
+            sessions.append((ts, r.get("Pods", ""), r))
+
+        elif msg == "created nodeclaim" and ncn:
+            s = get(ncn)
+            s.t_created = ts
+            s.nodepool = (r.get("NodePool") or {}).get("name") if isinstance(r.get("NodePool"), dict) else r.get("NodePool")
+            s.requests = r.get("requests")
+            itypes = r.get("instance-types", "")
+            if isinstance(itypes, str):
+                parts = [p.strip() for p in itypes.split(",")]
+                extra = 0
+                m = re.search(r"and (\d+) other\(s\)", itypes)
+                if m:
+                    extra = int(m.group(1))
+                    parts = [p for p in parts if "other(s)" not in p]
+                s.candidate_types = [p for p in parts if p]
+                s.candidate_count = len(s.candidate_types) + extra
+            # attach the most recent provisioning session within 60s
+            for sts, pods, _ in reversed(sessions):
+                if sts and ts and 0 <= (ts - sts).total_seconds() <= 60:
+                    s.trigger_pods = [p.strip() for p in pods.split(",") if p.strip()]
+                    break
+            # or: was this nodeclaim created as a consolidation replacement?
+            for rts, rnames, rreason, rsav in reversed(replace_cmds):
+                if rts and ts and 0 <= (ts - rts).total_seconds() <= 15:
+                    s.replaces = {"nodes": rnames, "reason": rreason, "savings": rsav}
+                    break
+
+        elif msg == "launched nodeclaim" and ncn:
+            s = get(ncn)
+            s.t_launched = ts
+            s.provider_id = r.get("provider-id")
+            s.instance_type = r.get("instance-type")
+            s.zone = r.get("zone")
+            s.capacity_type = r.get("capacity-type")
+            s.allocatable = r.get("allocatable")
+
+        elif msg == "registered nodeclaim" and ncn:
+            s = get(ncn)
+            s.t_registered = ts
+            node = r.get("Node")
+            s.node = node.get("name") if isinstance(node, dict) else node
+
+        elif msg == "initialized nodeclaim" and ncn:
+            get(ncn).t_initialized = ts
+
+        elif msg == "deleted nodeclaim" and ncn:
+            get(ncn).t_deleted = ts
+
+        elif "disrupting node(s)" in msg or "disrupting nodeclaim(s)" in msg:
+            # v1.x: "command" field looks like
+            #   "Empty/<uuid>: delete: nodepools=[default]: [node-a] (savings: $0.27)"
+            # reason is the prefix; savings appears for consolidation decisions
+            cmd = r.get("command", "") or ""
+            reason = r.get("reason") or (cmd.split("/", 1)[0] if "/" in cmd else None)
+            decision = r.get("decision")
+            savings = None
+            m = re.search(r"savings: \$([\d.]+)", cmd)
+            if m:
+                savings = float(m.group(1))
+            disrupted = r.get("disrupted-nodes") or r.get("nodes") or []
+            if isinstance(disrupted, dict):
+                disrupted = [disrupted]
+            names = []
+            for d in disrupted:
+                if isinstance(d, dict):
+                    nm = (d.get("NodeClaim") or {}).get("name") if isinstance(d.get("NodeClaim"), dict) else d.get("NodeClaim")
+                    if nm:
+                        names.append(nm)
+            if ncn and not names:
+                names = [ncn]
+            for nm in names:
+                s = get(nm)
+                s.disruption = {
+                    "ts": ts, "reason": reason, "decision": decision,
+                    "replacements": r.get("replacement-node-count", 0),
+                    "pods": r.get("pod-count"),
+                    "savings": savings,
+                    "raw": cmd or msg,
+                }
+            if r.get("replacement-node-count", 0) > 0:
+                replace_cmds.append((ts, names, reason, savings))
+
+    # events: nominations + disruption blocks
+    for e in store.events():
+        ts = parse_ts(e.get("lastTimestamp"))
+        if e.get("reason") == "Nominated" and e.get("kind") == "Pod":
+            m = re.search(r"nodeclaim/([\w-]+)", e.get("message", ""))
+            if m and m.group(1) in stories:
+                stories[m.group(1)].nominated_pods.append(
+                    f'{e.get("namespace")}/{e.get("name")}')
+        elif e.get("reason") in ("DisruptionBlocked", "Unconsolidatable"):
+            nm = e.get("name")
+            if e.get("kind") == "NodeClaim" and nm in stories:
+                stories[nm].disruption_blocked.append((ts, e.get("message")))
+
+    # snapshots fill gaps (nodeclaims we never saw created in logs)
+    for name, obj in store.objects("nodeclaims").items():
+        s = get(name)
+        s.raw_claim = obj
+        md, sp, st = obj["metadata"], obj["spec"], obj.get("status", {})
+        s.nodepool = s.nodepool or md.get("labels", {}).get("karpenter.sh/nodepool")
+        s.instance_type = s.instance_type or md.get("labels", {}).get("node.kubernetes.io/instance-type")
+        s.zone = s.zone or md.get("labels", {}).get("topology.kubernetes.io/zone")
+        s.capacity_type = s.capacity_type or md.get("labels", {}).get("karpenter.sh/capacity-type")
+        s.provider_id = s.provider_id or st.get("providerID")
+        s.node = s.node or st.get("nodeName")
+        if not s.t_created:
+            s.t_created = parse_ts(md.get("creationTimestamp"))
+
+    for s in stories.values():
+        s.nominated_pods = sorted(set(s.nominated_pods))
+    return stories
+
+def live_nodeclaims():
+    try:
+        return {o["metadata"]["name"]: o for o in kubectl_json("get nodeclaims")["items"]}
+    except Exception:
+        return {}
+
+def instance_id(provider_id):
+    return provider_id.rsplit("/", 1)[-1] if provider_id else None
+
+def instance_features(itype):
+    """Decode an instance type name: family, generation, feature suffixes."""
+    fam = itype.split(".")[0]
+    m = re.match(r"([a-z]+)(\d+)([a-z-]*)", fam)
+    if not m:
+        return {"family": fam, "generation": 0, "suffix": ""}
+    return {"family": fam, "generation": int(m.group(2)),
+            "suffix": m.group(3).replace("g", "").replace("a", "").replace("i", "")}
+
+# ---------------------------------------------------------------- pricing (best effort)
+
+_price_cache = None
+def spot_price(itype, az):
+    global _price_cache
+    if _price_cache is None:
+        _price_cache = {}
+    key = (itype, az)
+    if key in _price_cache:
+        return _price_cache[key]
+    try:
+        out = json.loads(sh(
+            f"aws ec2 describe-spot-price-history --instance-types {itype} "
+            f"--availability-zone {az} --product-descriptions 'Linux/UNIX' "
+            f"--max-items 1 --output json", timeout=30))
+        p = out["SpotPriceHistory"][0]["SpotPrice"]
+        _price_cache[key] = float(p)
+    except Exception:
+        _price_cache[key] = None
+    return _price_cache[key]
+
+# ---------------------------------------------------------------- commands
+
+def cmd_nodes(store, args):
+    stories = build_stories(store)
+    live = live_nodeclaims()
+    live_nodes = {}
+    try:
+        for n in kubectl_json("get nodes -l karpenter.sh/nodepool")["items"]:
+            live_nodes[n["metadata"]["name"]] = n
+    except Exception:
+        pass
+
+    rows = []
+    for name, s in sorted(stories.items(), key=lambda kv: kv[1].t_created or datetime.min.replace(tzinfo=timezone.utc)):
+        alive = name in live
+        if args.live and not alive:
+            continue
+        status = green("RUNNING") if alive else \
+                 (red("DISRUPTED") if s.disruption else dim("GONE"))
+        age = ""
+        if s.t_created:
+            end = s.t_deleted or datetime.now(timezone.utc)
+            age = fmt_dur((end - s.t_created).total_seconds())
+        rows.append([
+            name, s.node or "-", s.instance_type or "?", s.capacity_type or "?",
+            s.zone or "?", instance_id(s.provider_id) or "-", status, age,
+        ])
+    if not rows:
+        print("no karpenter nodes found (run some workloads, or `kexplain sync`)")
+        return
+    hdr = ["NODECLAIM", "NODE", "TYPE", "CAPACITY", "ZONE", "INSTANCE-ID", "STATUS", "LIFETIME"]
+    widths = [max(len(str(r[i])) if not str(r[i]).startswith("\033") else len(re.sub(r"\033\[\d+m", "", str(r[i])))
+                  for r in [hdr] + rows) for i in range(len(hdr))]
+    def prow(r, is_hdr=False):
+        cells = []
+        for i, v in enumerate(r):
+            plain = re.sub(r"\033\[\d+m", "", str(v))
+            pad = " " * (widths[i] - len(plain))
+            cells.append(str(v) + pad)
+        line = "  ".join(cells)
+        print(bold(line) if is_hdr else line)
+    prow(hdr, True)
+    for r in rows:
+        prow(r)
+
+def cmd_history(store, args):
+    stories = build_stories(store)
+    logs = store.logs()
+    entries = []  # (ts, line)
+
+    for r in logs:
+        msg = r.get("message", "")
+        ts = parse_ts(r.get("time"))
+        if not ts:
+            continue
+        if msg == "found provisionable pod(s)":
+            pods = [p.strip() for p in r.get("Pods", "").split(",") if p.strip()]
+            entries.append((ts, f'{yellow("PENDING")}    {len(pods)} unschedulable pod(s): '
+                                f'{", ".join(pods[:4])}{" …" if len(pods) > 4 else ""}'))
+        elif msg == "computed new nodeclaim(s) to fit pod(s)":
+            entries.append((ts, f'{cyan("DECIDE")}     fit {r.get("pods")} pod(s) onto '
+                                f'{r.get("nodeclaims")} new nodeclaim(s)'))
+
+    for name, s in stories.items():
+        if s.t_created:
+            entries.append((s.t_created,
+                f'{cyan("CREATE")}     nodeclaim {bold(name)} (nodepool {s.nodepool}, '
+                f'{s.candidate_count or "?"} candidate types)'))
+        if s.t_launched:
+            price = ""
+            entries.append((s.t_launched,
+                f'{green("LAUNCH")}     {bold(name)} → {s.instance_type} '
+                f'({s.capacity_type}) in {s.zone}{price}'))
+        if s.t_registered:
+            entries.append((s.t_registered,
+                f'{green("REGISTER")}   {name} joined as node {s.node}'))
+        if s.t_initialized:
+            entries.append((s.t_initialized, f'{green("READY")}      {name} initialized'))
+        if s.disruption and s.disruption.get("ts"):
+            d = s.disruption
+            sav = f', saves ${d["savings"]:.2f}/hr' if d.get("savings") is not None else ""
+            entries.append((d["ts"],
+                f'{magenta("DISRUPT")}    {bold(name)} via {d.get("reason") or "?"} '
+                f'({d.get("decision") or "?"}, {d.get("replacements", 0)} replacement(s){sav})'))
+        if s.t_deleted:
+            entries.append((s.t_deleted, f'{red("DELETE")}     nodeclaim {name} removed'))
+
+    entries.sort(key=lambda e: e[0])
+    if args.since:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=args.since)
+        entries = [e for e in entries if e[0] >= cutoff]
+    if not entries:
+        print("no history yet")
+        return
+    last_day = None
+    for ts, line in entries:
+        day = ts.strftime("%Y-%m-%d")
+        if day != last_day:
+            print(bold(f"\n── {day} " + "─" * 40))
+            last_day = day
+        print(f'{dim(ts.strftime("%H:%M:%S"))}  {line}')
+
+def _tree(lines):
+    """lines: list of (depth, text). Renders box-drawing tree."""
+    out = []
+    for i, (depth, text) in enumerate(lines):
+        if depth == 0:
+            out.append(text)
+            continue
+        # is this the last line at this depth before a shallower one?
+        last = True
+        for d2, _ in lines[i + 1:]:
+            if d2 < depth:
+                break
+            if d2 == depth:
+                last = False
+                break
+        prefix = ""
+        for d in range(1, depth):
+            # does any later line exist at depth d? then vertical bar
+            bar = False
+            for d2, _ in lines[i + 1:]:
+                if d2 < d:
+                    break
+                if d2 == d:
+                    bar = True
+                    break
+            prefix += ("│  " if bar else "   ")
+        prefix += "└─ " if last else "├─ "
+        out.append(dim(prefix) + text)
+    return "\n".join(out)
+
+def resolve_target(stories, target):
+    """target may be a node name, nodeclaim name, or instance id."""
+    if target in stories:
+        return stories[target]
+    for s in stories.values():
+        if s.node == target or instance_id(s.provider_id) == target:
+            return s
+    # prefix match
+    matches = [s for n, s in stories.items() if n.startswith(target)]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+def requirement_str(req):
+    op = req.get("operator", "")
+    vals = req.get("values", [])
+    key = req["key"]
+    if op == "In" and len(vals) == 1:
+        return f"{key} = {vals[0]}"
+    if op == "In":
+        return f"{key} in [{', '.join(vals)}]"
+    if op in ("Gt", "Lt", "Gte", "Lte"):
+        sym = {"Gt": ">", "Lt": "<", "Gte": ">=", "Lte": "<="}[op]
+        return f"{key} {sym} {vals[0]}"
+    if op == "Exists":
+        return f"{key} exists"
+    return f"{key} {op} {vals}"
+
+def build_funnel(store, s, pool):
+    """Recompute the constraint funnel: how each requirement shrank the
+    instance-type universe, ending at the type CreateFleet picked.
+    Returns list of (label, remaining_names, eliminated_count) stages."""
+    try:
+        cat = ec2_catalog(store)
+    except Exception:
+        return None
+    if not cat:
+        return None
+
+    stages = []
+    remaining = dict(cat)
+    stages.append(("EC2 instance types in region", dict(remaining), 0))
+
+    def apply(label, reqs):
+        nonlocal remaining
+        before = len(remaining)
+        remaining = {n: i for n, i in remaining.items()
+                     if all(match_requirement(i, r) for r in reqs)}
+        stages.append((label, dict(remaining), before - len(remaining)))
+
+    # 1. each NodePool requirement, one stage per requirement
+    pool_reqs = {}
+    if pool:
+        for r in pool["spec"]["template"]["spec"].get("requirements", []):
+            if r["key"] == "kubernetes.io/os":
+                continue
+            pool_reqs[r["key"]] = r
+            apply(f'NodePool: {requirement_str(r)}', [r])
+
+    # 2. pod-injected requirements (claim reqs narrower than the pool's)
+    claim_reqs = (s.raw_claim or {}).get("spec", {}).get("requirements", [])
+    for r in claim_reqs:
+        key = r["key"]
+        if key in ("karpenter.sh/nodepool", "karpenter.k8s.aws/ec2nodeclass",
+                   "kubernetes.io/os", "node.kubernetes.io/instance-type",
+                   "topology.kubernetes.io/zone"):
+            continue
+        pr = pool_reqs.get(key)
+        if pr and pr.get("operator") == r.get("operator") and \
+           sorted(pr.get("values", [])) == sorted(r.get("values", [])):
+            continue  # identical to pool stage, already applied
+        apply(f'pod constraint: {requirement_str(r)}', [r])
+
+    # 3. resource fit (aggregated requests must fit with system overhead)
+    reqs = s.requests if isinstance(s.requests, dict) else None
+    if reqs:
+        cpu = parse_quantity(reqs.get("cpu", 0))
+        mem = parse_quantity(reqs.get("memory", 0))
+        before = len(remaining)
+        remaining = {n: i for n, i in remaining.items()
+                     if (not cpu or i["cpu"] * 0.9 >= cpu) and
+                        (not mem or i["memory_mib"] * 2**20 * 0.85 >= mem)}
+        stages.append((f'resource fit: cpu≥{reqs.get("cpu")}, mem≥{reqs.get("memory")}'
+                       f' (after ~10-15% system overhead)',
+                       dict(remaining), before - len(remaining)))
+    return stages
+
+def render_funnel(stages, s, L):
+    """Append funnel stages to the explain tree lines."""
+    L.append((1, bold("FUNNEL") + dim("  (recomputed from the live EC2 catalog)")))
+    width0 = len(stages[0][1]) or 1
+    BAR = 30
+    for label, remaining, eliminated in stages:
+        n = len(remaining)
+        bar = "█" * max(1, int(BAR * n / width0)) if n else "·"
+        drop = red(f'  −{eliminated}') if eliminated else ""
+        L.append((2, f'{dim(bar.ljust(BAR))} {bold(str(n).rjust(4))}  {label}{drop}'))
+        # name survivors when the set gets small
+        if 0 < n <= 12 and eliminated:
+            L.append((3, dim(", ".join(sorted(remaining)))))
+        elif eliminated and n <= 40:
+            fams = sorted({i["family"] for i in remaining.values()})
+            L.append((3, dim(f'families: {", ".join(fams)}')))
+    # reconciliation with what karpenter itself reported
+    if s.candidate_count:
+        n = len(stages[-1][1])
+        note = "matches" if abs(n - s.candidate_count) <= max(3, n // 10) else \
+               "differs — Karpenter also filters by zone offerings & AMI compat"
+        L.append((2, dim(f'karpenter itself reported {s.candidate_count} candidates ({note})')))
+    if s.instance_type:
+        bar = "▏"
+        L.append((2, f'{dim(bar.ljust(30))} {bold("   1")}  '
+                     f'CreateFleet picks: {green(bold(s.instance_type))} '
+                     f'({s.capacity_type}, {s.zone})'))
+
+def cmd_explain(store, args):
+    stories = build_stories(store)
+    s = resolve_target(stories, args.target)
+    if not s:
+        sys.exit(f"error: no nodeclaim/node matching '{args.target}'. "
+                 f"Try `kexplain nodes` to list known ones.")
+
+    if args.json:
+        print(json.dumps({k: (fmt_ts(v) if isinstance(v, datetime) else v)
+                          for k, v in vars(s).items() if k != "raw_claim"},
+                         indent=2, default=str))
+        return
+
+    live = s.name in live_nodeclaims()
+    status = green("RUNNING") if live else (red("DISRUPTED/GONE") if (s.disruption or s.t_deleted) else dim("GONE"))
+
+    L = []  # (depth, text)
+    L.append((0, f'\n{bold("NODE " + (s.node or "(never registered)"))}  '
+                 f'{dim("nodeclaim=" + s.name)}  [{status}]'))
+    if s.provider_id:
+        L.append((0, dim(f'     {s.provider_id}')))
+
+    # -- 1. trigger
+    L.append((1, bold("TRIGGER") + (f'  @ {fmt_ts(s.t_created)}' if s.t_created else "")))
+    if s.replaces:
+        sav = f' (est. savings ${s.replaces["savings"]:.2f}/hr)' if s.replaces.get("savings") is not None else ""
+        L.append((2, magenta(f'consolidation replacement: launched to replace '
+                             f'{", ".join(s.replaces["nodes"])} '
+                             f'via {s.replaces["reason"]}{sav}')))
+    if s.trigger_pods:
+        L.append((2, f'{len(s.trigger_pods)} unschedulable pod(s) could not fit on existing nodes:'))
+        for p in s.trigger_pods[:8]:
+            L.append((3, cyan(p)))
+        if len(s.trigger_pods) > 8:
+            L.append((3, dim(f'… and {len(s.trigger_pods) - 8} more')))
+    elif s.nominated_pods:
+        L.append((2, f'pods nominated to this node: {", ".join(s.nominated_pods[:6])}'))
+    else:
+        L.append((2, dim("trigger pods unknown (logs may predate the local store)")))
+
+    # -- 2. constraints
+    L.append((1, bold("CONSTRAINTS")))
+    pool = store.objects("nodepools").get(s.nodepool or "")
+    if pool:
+        reqs = pool["spec"]["template"]["spec"].get("requirements", [])
+        L.append((2, f'NodePool {bold(s.nodepool)} requirements:'))
+        for r in reqs:
+            L.append((3, requirement_str(r)))
+        lim = pool["spec"].get("limits")
+        if lim:
+            L.append((3, dim(f'limits: {json.dumps(lim)}')))
+    elif s.nodepool:
+        L.append((2, f'NodePool: {s.nodepool} (spec not in store)'))
+    if s.raw_claim:
+        creqs = s.raw_claim["spec"].get("requirements", [])
+        skip_keys = {"karpenter.sh/nodepool", "karpenter.k8s.aws/ec2nodeclass",
+                     "kubernetes.io/os"}
+        interesting = [r for r in creqs if r["key"] not in skip_keys]
+        # which requirements were injected by pod scheduling constraints
+        # (i.e. not present with the same values in the NodePool template)?
+        def norm(op, vals):
+            # karpenter normalizes Gt n → Gte n+1 and Lt n → Lte n-1 in nodeclaims
+            try:
+                if op == "Gt":
+                    return ("Gte", (str(int(vals[0]) + 1),))
+                if op == "Lt":
+                    return ("Lte", (str(int(vals[0]) - 1),))
+            except (ValueError, IndexError):
+                pass
+            return (op, tuple(sorted(vals)))
+        pool_reqs = {}
+        if pool:
+            for r in pool["spec"]["template"]["spec"].get("requirements", []):
+                pool_reqs[r["key"]] = norm(r.get("operator"), r.get("values", []))
+        if interesting:
+            L.append((2, 'Resolved NodeClaim requirements (NodePool ∩ pod constraints):'))
+            for r in interesting:
+                txt = requirement_str(r)
+                if r["key"] == "node.kubernetes.io/instance-type" and len(r.get("values", [])) > 6:
+                    txt = f'node.kubernetes.io/instance-type in [{len(r["values"])} types]'
+                pr = pool_reqs.get(r["key"])
+                from_pod = pool_reqs and pr != norm(r.get("operator"), r.get("values", [])) \
+                    and r["key"] != "node.kubernetes.io/instance-type"
+                if from_pod:
+                    txt += yellow("   ← narrowed by pod constraints")
+                L.append((3, txt))
+    if s.requests:
+        L.append((2, f'Aggregated resource requests: '
+                     f'{json.dumps(s.requests) if not isinstance(s.requests, str) else s.requests}'))
+
+    # -- 3. candidates
+    L.append((1, bold("CANDIDATES")))
+    if s.candidate_count:
+        L.append((2, f'{bold(str(s.candidate_count))} instance types satisfied all constraints'))
+        if s.candidate_types:
+            L.append((2, f'sample candidates: ' + ", ".join(s.candidate_types[:10])
+                         + dim(f'  (full set sent to CreateFleet)')))
+    else:
+        L.append((2, dim("candidate list unknown (created before log harvesting began)")))
+
+    # -- 3b. funnel view
+    if not args.no_funnel:
+        stages = build_funnel(store, s, pool)
+        if stages:
+            render_funnel(stages, s, L)
+
+    # -- 4. launch decision
+    L.append((1, bold("LAUNCH DECISION") + (f'  @ {fmt_ts(s.t_launched)}' if s.t_launched else "")))
+    if s.instance_type:
+        cap = s.capacity_type or "?"
+        price_txt = ""
+        if not args.no_prices and cap == "spot" and s.zone:
+            p = spot_price(s.instance_type, s.zone)
+            if p:
+                price_txt = f' @ ~${p:.4f}/hr (current spot)'
+        L.append((2, f'EC2 CreateFleet chose {bold(s.instance_type)} ({cap}) '
+                     f'in {s.zone}{price_txt}'))
+        strategy = ("price-capacity-optimized across spot offerings"
+                    if cap == "spot" else "lowest-price across on-demand offerings")
+        L.append((2, f'allocation strategy: {strategy}'
+                     + (f' ({s.candidate_count} types × zones in the request)' if s.candidate_count else "")))
+        # why-not-cheaper: compare chosen type vs the cheapest candidates
+        if not args.no_prices and cap == "spot" and s.zone and s.candidate_types:
+            chosen_p = spot_price(s.instance_type, s.zone)
+            alts = []
+            for alt in [t for t in s.candidate_types if t != s.instance_type][:3]:
+                p = spot_price(alt, s.zone)
+                if p:
+                    alts.append((alt, p))
+            if chosen_p and alts:
+                cheaper = [(a, p) for a, p in alts if p < chosen_p]
+                if cheaper:
+                    a, p = min(cheaper, key=lambda x: x[1])
+                    L.append((2, yellow(
+                        f'why not cheaper? {a} spot is ~${p:.4f}/hr vs chosen '
+                        f'~${chosen_p:.4f}/hr — price-capacity-optimized weighs '
+                        f'interruption risk, not just price')))
+                else:
+                    L.append((2, green('chosen type was also the cheapest spot offering among top candidates')))
+        if s.allocatable:
+            alloc = s.allocatable if isinstance(s.allocatable, str) else json.dumps(s.allocatable)
+            L.append((2, dim(f'allocatable: {alloc}')))
+    else:
+        L.append((2, dim("launch details unknown")))
+
+    # -- 4b. feature attribution: did we ASK for the premium features we got?
+    if s.instance_type:
+        feats = instance_features(s.instance_type)
+        claim_reqs = (s.raw_claim or {}).get("spec", {}).get("requirements", [])
+        req_keys = {r["key"] for r in claim_reqs}
+        premium = []
+        if "d" in feats["suffix"]:
+            premium.append(("local NVMe storage ('d' variant)",
+                            "karpenter.k8s.aws/instance-local-nvme" in req_keys))
+        if "n" in feats["suffix"]:
+            premium.append(("enhanced networking ('n' variant)",
+                            "karpenter.k8s.aws/instance-network-bandwidth" in req_keys))
+        if feats["generation"] >= 7:
+            gen_req = any(r["key"] == "karpenter.k8s.aws/instance-generation" and
+                          r.get("operator") in ("Gt", "Gte") and
+                          r.get("values") and float(r["values"][0]) >= 6
+                          for r in claim_reqs)
+            premium.append((f'latest generation (gen {feats["generation"]})', gen_req))
+        if premium:
+            L.append((1, bold("FEATURE ATTRIBUTION") + dim("  (premium features of the chosen type)")))
+            for label, required in premium:
+                if required:
+                    L.append((2, f'{label}: {green("explicitly required")} by a scheduling constraint'))
+                else:
+                    L.append((2, f'{label}: {yellow("NOT required by any constraint")} — '
+                                 f'CreateFleet picked it from the {s.candidate_count or "?"}-type '
+                                 f'candidate set ({"interruption-risk weighting" if s.capacity_type == "spot" else "it priced lowest at launch"})'))
+            if any(not req for _, req in premium):
+                L.append((2, dim('to prevent: add NodePool requirements, e.g. '
+                                 'instance-local-nvme DoesNotExist, instance-generation Lt N, '
+                                 'or instance-family NotIn [...]')))
+
+    # -- 5. lifecycle
+    L.append((1, bold("LIFECYCLE")))
+    steps = []
+    if s.t_created:    steps.append(("created", s.t_created))
+    if s.t_launched:   steps.append(("launched", s.t_launched))
+    if s.t_registered: steps.append((f'registered as {s.node}', s.t_registered))
+    if s.t_initialized:steps.append(("initialized (ready)", s.t_initialized))
+    if s.t_deleted:    steps.append(("deleted", s.t_deleted))
+    for i, (label, ts) in enumerate(steps):
+        delta = ""
+        if i > 0:
+            delta = dim(f'  (+{fmt_dur((ts - steps[i-1][1]).total_seconds())})')
+        L.append((2, f'{fmt_ts(ts)}  {label}{delta}'))
+    if s.t_created and s.t_initialized:
+        L.append((2, green(f'pod-schedulable in {fmt_dur((s.t_initialized - s.t_created).total_seconds())} from decision')))
+    if s.nominated_pods:
+        L.append((2, f'pods scheduled here: {", ".join(s.nominated_pods[:6])}'
+                     + (dim(f' … +{len(s.nominated_pods)-6}') if len(s.nominated_pods) > 6 else "")))
+
+    # -- 6. disruption
+    L.append((1, bold("DISRUPTION")))
+    if s.disruption:
+        d = s.disruption
+        L.append((2, magenta(f'@ {fmt_ts(d.get("ts"))}: disrupted via '
+                             f'{d.get("reason") or "?"} → {d.get("decision") or "?"}')))
+        if d.get("savings") is not None:
+            L.append((3, green(f'estimated savings: ${d["savings"]:.2f}/hr')))
+        if d.get("replacements"):
+            L.append((3, f'{d["replacements"]} replacement node(s) launched'))
+        else:
+            L.append((3, "no replacement (workload fits on remaining nodes)"))
+        if d.get("pods") is not None:
+            L.append((3, f'{d["pods"]} pod(s) rescheduled'))
+    elif s.disruption_blocked:
+        ts, msg = s.disruption_blocked[-1]
+        L.append((2, yellow(f'disruption currently blocked: {msg} ({fmt_ts(ts)})')))
+    elif live:
+        L.append((2, dim("none — node is running and not marked for disruption")))
+    else:
+        L.append((2, dim("node is gone; no disruption decision captured in store")))
+
+    print(_tree(L))
+    print()
+
+def cmd_sync(store, args):
+    sync(store, quiet=False)
+    logs = store.logs()
+    print(f"store: {store.dir}")
+    print(f"  {len(logs)} log lines, {len(store.events())} events, "
+          f"{len(store.objects('nodeclaims'))} nodeclaims, "
+          f"{len(store.objects('nodes'))} nodes")
+
+# ------------------------------------------------- before-the-fact: plan
+
+WELL_KNOWN = {
+    "kubernetes.io/arch", "kubernetes.io/os", "karpenter.sh/capacity-type",
+    "karpenter.k8s.aws/instance-category", "karpenter.k8s.aws/instance-generation",
+    "karpenter.k8s.aws/instance-cpu", "karpenter.k8s.aws/instance-memory",
+    "karpenter.k8s.aws/instance-size", "karpenter.k8s.aws/instance-family",
+    "node.kubernetes.io/instance-type", "topology.kubernetes.io/zone",
+}
+
+def _parse_bandwidth(perf):
+    """'25 Gigabit' → 25000; 'Up to 10 Gigabit' → 10000; else 0."""
+    m = re.search(r"([\d.]+)\s*Gigabit", perf or "")
+    return int(float(m.group(1)) * 1000) if m else 0
+
+def ec2_catalog(store):
+    cache = os.path.join(store.dir, "ec2-catalog-v2.json")
+    if os.path.exists(cache) and \
+       (datetime.now().timestamp() - os.path.getmtime(cache)) < 86400 * 7:
+        with open(cache) as f:
+            return json.load(f)
+    print(dim("  fetching EC2 instance type catalog (cached 7 days)…"))
+    out, token, types = None, None, []
+    while True:
+        cmd = ("aws ec2 describe-instance-types --output json "
+               "--filters Name=supported-virtualization-type,Values=hvm ")
+        if token:
+            cmd += f"--starting-token {token} "
+        out = json.loads(sh(cmd, timeout=120))
+        types.extend(out["InstanceTypes"])
+        token = out.get("NextToken")
+        if not token:
+            break
+    cat = {}
+    for t in types:
+        name = t["InstanceType"]
+        fam = name.split(".")[0]
+        m = re.match(r"([a-z]+)(\d+)", fam)
+        manuf = (t.get("ProcessorInfo", {}).get("Manufacturer") or "").lower()
+        cat[name] = {
+            "family": fam,
+            "category": m.group(1) if m else fam,
+            "generation": int(m.group(2)) if m else 0,
+            "size": name.split(".", 1)[1] if "." in name else "",
+            "arch": "arm64" if "arm64" in t.get("ProcessorInfo", {}).get("SupportedArchitectures", []) else "amd64",
+            "cpu": t.get("VCpuInfo", {}).get("DefaultVCpus", 0),
+            "memory_mib": t.get("MemoryInfo", {}).get("SizeInMiB", 0),
+            "spot": "spot" in t.get("SupportedUsageClasses", []),
+            "od": "on-demand" in t.get("SupportedUsageClasses", []),
+            "nvme_gb": (t.get("InstanceStorageInfo", {}) or {}).get("TotalSizeInGB", 0)
+                       if (t.get("InstanceStorageInfo", {}) or {}).get("Disks", [{}])[0].get("Type") == "ssd"
+                       else 0,
+            "manufacturer": ("intel" if "intel" in manuf else
+                             "amd" if "amd" in manuf else
+                             "aws" if "amazon" in manuf or "aws" in manuf else manuf),
+            "bandwidth_mbps": _parse_bandwidth(t.get("NetworkInfo", {}).get("NetworkPerformance", "")),
+        }
+    with open(cache, "w") as f:
+        json.dump(cat, f)
+    return cat
+
+def match_requirement(info, req):
+    key, op = req["key"], req.get("operator", "In")
+    vals = req.get("values", [])
+    actual = None
+    if key == "kubernetes.io/arch":
+        actual = info["arch"]
+    elif key == "kubernetes.io/os":
+        return True  # linux catalog only
+    elif key == "karpenter.sh/capacity-type":
+        return (("spot" in vals and info["spot"]) or
+                ("on-demand" in vals and info["od"])) if op == "In" else True
+    elif key == "karpenter.k8s.aws/instance-category":
+        actual = info["category"][0]
+    elif key == "karpenter.k8s.aws/instance-family":
+        actual = info["family"]
+    elif key == "karpenter.k8s.aws/instance-generation":
+        actual = info["generation"]
+    elif key == "karpenter.k8s.aws/instance-cpu":
+        actual = info["cpu"]
+    elif key == "karpenter.k8s.aws/instance-memory":
+        actual = info["memory_mib"]
+    elif key == "karpenter.k8s.aws/instance-size":
+        actual = info["size"]
+    elif key == "karpenter.k8s.aws/instance-local-nvme":
+        if op == "DoesNotExist":
+            return info["nvme_gb"] == 0
+        if op == "Exists":
+            return info["nvme_gb"] > 0
+        actual = info["nvme_gb"]
+    elif key == "karpenter.k8s.aws/instance-cpu-manufacturer":
+        actual = info["manufacturer"]
+    elif key == "karpenter.k8s.aws/instance-network-bandwidth":
+        actual = info["bandwidth_mbps"]
+    elif key == "node.kubernetes.io/instance-type":
+        actual = None  # set by caller via name
+    else:
+        return True  # unknown key: don't filter
+    if actual is None:
+        return True
+    if op == "In":
+        return str(actual) in vals or actual in vals
+    if op == "NotIn":
+        return str(actual) not in vals
+    try:
+        if op == "Gt":
+            return float(actual) > float(vals[0])
+        if op == "Lt":
+            return float(actual) < float(vals[0])
+        if op == "Gte":
+            return float(actual) >= float(vals[0])
+        if op == "Lte":
+            return float(actual) <= float(vals[0])
+    except (ValueError, TypeError):
+        return True
+    if op == "Exists":
+        return True
+    return True
+
+def parse_quantity(q):
+    """k8s quantity → (cpu millicores | memory bytes) float, unit-agnostic."""
+    q = str(q)
+    units = {"m": 1e-3, "k": 1e3, "M": 1e6, "G": 1e9, "T": 1e12,
+             "Ki": 2**10, "Mi": 2**20, "Gi": 2**30, "Ti": 2**40}
+    m = re.match(r"^([\d.]+)([A-Za-z]*)$", q)
+    if not m:
+        return 0.0
+    val, unit = float(m.group(1)), m.group(2)
+    return val * units.get(unit, 1.0)
+
+def cmd_plan(store, args):
+    # read pod spec (yaml via kubectl's converter to avoid a yaml dependency)
+    with open(args.file) as f:
+        content = f.read()
+    if content.lstrip().startswith("{"):
+        pod = json.loads(content)
+    else:
+        # convert yaml → json without PyYAML: use kubectl create --dry-run
+        p = subprocess.run(
+            f"kubectl create --dry-run=client -o json -f {args.file}",
+            shell=True, capture_output=True, text=True)
+        if p.returncode != 0:
+            sys.exit(f"error: could not parse {args.file}: {p.stderr.strip()}")
+        pod = json.loads(p.stdout)
+    if pod.get("kind") == "List":
+        pod = pod["items"][0]
+    spec = pod.get("spec", {})
+    if pod.get("kind") in ("Deployment", "ReplicaSet", "Job", "StatefulSet", "DaemonSet"):
+        spec = spec.get("template", {}).get("spec", {})
+
+    # pod requirements
+    cpu_req = mem_req = 0.0
+    for ctr in spec.get("containers", []):
+        r = ctr.get("resources", {}).get("requests", {})
+        cpu_req += parse_quantity(r.get("cpu", 0))
+        mem_req += parse_quantity(r.get("memory", 0))
+    pod_reqs = []
+    for k, v in (spec.get("nodeSelector") or {}).items():
+        pod_reqs.append({"key": k, "operator": "In", "values": [v]})
+    aff = ((spec.get("affinity") or {}).get("nodeAffinity") or {}) \
+        .get("requiredDuringSchedulingIgnoredDuringExecution") or {}
+    for term in aff.get("nodeSelectorTerms", [])[:1]:
+        pod_reqs.extend(term.get("matchExpressions", []))
+
+    cat = ec2_catalog(store)
+    pools = store.objects("nodepools")
+    if not pools:
+        sync(store, quiet=True)
+        pools = store.objects("nodepools")
+
+    print(bold(f"\nPLAN for {pod.get('kind', 'Pod')}/"
+               f"{pod.get('metadata', {}).get('name', '?')}"
+               f"  (requests: cpu={cpu_req or '?'}, mem={int(mem_req / 2**20) if mem_req else '?'}Mi)"))
+    for pname, pool in sorted(pools.items()):
+        reqs = pool["spec"]["template"]["spec"].get("requirements", []) + pod_reqs
+        # explicit instance-type pinning
+        pinned = None
+        for r in reqs:
+            if r["key"] == "node.kubernetes.io/instance-type" and r.get("operator") == "In":
+                pinned = set(r["values"])
+        matches = []
+        for name, info in cat.items():
+            if pinned and name not in pinned:
+                continue
+            if all(match_requirement(info, r) for r in reqs):
+                # must also fit the pod (leave ~10% headroom for daemonsets/system)
+                if cpu_req and info["cpu"] * 1000 * 0.9 < cpu_req * 1000:
+                    continue
+                if mem_req and info["memory_mib"] * 2**20 * 0.85 < mem_req:
+                    continue
+                matches.append((name, info))
+        # pod-level conflict check
+        conflict = None
+        for r in pod_reqs:
+            pool_reqs = pool["spec"]["template"]["spec"].get("requirements", [])
+            for pr in pool_reqs:
+                if pr["key"] == r["key"] and pr.get("operator") == "In" and \
+                   r.get("operator") == "In" and not set(pr["values"]) & set(r["values"]):
+                    conflict = f'{r["key"]}: pod wants {r["values"]}, pool allows {pr["values"]}'
+        print(f'\n  NodePool {bold(pname)}: ', end="")
+        if conflict:
+            print(red(f"INCOMPATIBLE — {conflict}"))
+            continue
+        if not matches:
+            print(red("0 instance types fit"))
+            continue
+        matches.sort(key=lambda m: (m[1]["cpu"], m[1]["memory_mib"]))
+        print(green(f"{len(matches)} candidate instance types"))
+        cap_vals = ["spot", "on-demand"]
+        for r in reqs:
+            if r["key"] == "karpenter.sh/capacity-type" and r.get("operator") == "In":
+                cap_vals = r["values"]
+        print(dim(f'     capacity types: {", ".join(cap_vals)}; smallest that fit '
+                  f'(Karpenter will pick cheapest via CreateFleet):'))
+        for name, info in matches[:args.top]:
+            print(f'     {name:<20} {info["cpu"]:>3} vCPU  '
+                  f'{info["memory_mib"] / 1024:>7.1f} GiB  {info["arch"]}'
+                  f'{"  spot✓" if info["spot"] and "spot" in cap_vals else ""}')
+        if len(matches) > args.top:
+            print(dim(f'     … and {len(matches) - args.top} more'))
+    print()
+
+# ---------------------------------------------------------------- main
+
+def main():
+    global USE_COLOR
+    ap = argparse.ArgumentParser(prog="kexplain",
+                                 description="EXPLAIN plan for Karpenter decisions")
+    ap.add_argument("--no-color", action="store_true")
+    ap.add_argument("--no-sync", action="store_true",
+                    help="skip harvesting cluster state before running")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("sync", help="harvest logs/events/objects into local store")
+
+    p = sub.add_parser("nodes", help="list karpenter nodes (live + historical)")
+    p.add_argument("--live", action="store_true", help="only currently-running")
+
+    p = sub.add_parser("history", help="timeline of provisioning/disruption decisions")
+    p.add_argument("--since", type=float, metavar="HOURS", help="only last N hours")
+
+    p = sub.add_parser("explain", help="decision trace for one node")
+    p.add_argument("target", help="node name, nodeclaim name, or instance id")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--no-prices", action="store_true", help="skip spot price lookup")
+    p.add_argument("--no-funnel", action="store_true", help="skip the constraint funnel view")
+
+    p = sub.add_parser("plan", help="before-the-fact: which instance types could a pod get")
+    p.add_argument("-f", "--file", required=True, help="pod/deployment yaml or json")
+    p.add_argument("--top", type=int, default=10)
+
+    args = ap.parse_args()
+    if args.no_color:
+        USE_COLOR = False
+
+    store = Store(current_cluster())
+    if args.cmd != "sync" and not args.no_sync:
+        try:
+            sync(store, quiet=True)
+        except Exception as ex:
+            print(dim(f"  (sync skipped: {ex})"), file=sys.stderr)
+
+    {"sync": cmd_sync, "nodes": cmd_nodes, "history": cmd_history,
+     "explain": cmd_explain, "plan": cmd_plan}[args.cmd](store, args)
+
+if __name__ == "__main__":
+    main()

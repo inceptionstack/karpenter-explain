@@ -1,0 +1,22 @@
+# local harvest store lives in ~/.kexplain, never in-repo — but guard anyway
+.kexplain/
+*.jsonl
+ec2-catalog*.json
+
+# provisioning output (contains account ids, ARNs, instance ids)
+infra/*.log
+*.log
+
+# python
+__pycache__/
+*.pyc
+
+# editor / os
+.vscode/
+.idea/
+.DS_Store
+
+# credentials must never land here
+*.pem
+*.key
+.env

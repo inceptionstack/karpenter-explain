@@ -1,0 +1,72 @@
+# Workloads with varied constraints to exercise Karpenter's decision-making.
+---
+# 1. plain burst — lets Karpenter pick anything cheap (likely spot)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inflate
+spec:
+  replicas: 0
+  selector:
+    matchLabels: {app: inflate}
+  template:
+    metadata:
+      labels: {app: inflate}
+    spec:
+      terminationGracePeriodSeconds: 0
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 3000
+        fsGroup: 2000
+      containers:
+      - name: inflate
+        image: public.ecr.aws/eks-distro/kubernetes/pause:3.7
+        resources:
+          requests: {cpu: "1", memory: 1Gi}
+        securityContext:
+          allowPrivilegeEscalation: false
+---
+# 2. arm64-only — forces a graviton decision
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: arm-workload
+spec:
+  replicas: 0
+  selector:
+    matchLabels: {app: arm-workload}
+  template:
+    metadata:
+      labels: {app: arm-workload}
+    spec:
+      terminationGracePeriodSeconds: 0
+      nodeSelector:
+        kubernetes.io/arch: arm64
+      containers:
+      - name: pause
+        image: public.ecr.aws/eks-distro/kubernetes/pause:3.7
+        resources:
+          requests: {cpu: "2", memory: 2Gi}
+---
+# 3. on-demand only + zone pinned — narrows the candidate set hard
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: od-pinned
+spec:
+  replicas: 0
+  selector:
+    matchLabels: {app: od-pinned}
+  template:
+    metadata:
+      labels: {app: od-pinned}
+    spec:
+      terminationGracePeriodSeconds: 0
+      nodeSelector:
+        karpenter.sh/capacity-type: on-demand
+        topology.kubernetes.io/zone: us-east-1b
+      containers:
+      - name: pause
+        image: public.ecr.aws/eks-distro/kubernetes/pause:3.7
+        resources:
+          requests: {cpu: "3", memory: 4Gi}
