@@ -198,11 +198,21 @@ class TestParsing(unittest.TestCase):
             traits = dict(kx._premium_features(self._story(itype, [])))
             self.assertIn(key, traits, itype)
 
-    def test_common_categories_not_flagged(self):
-        # plain m/c/t families produce no category trait
-        for itype in ("m6g.large", "c5.large", "t3.micro"):
+    def test_general_purpose_categories_not_flagged(self):
+        # only general-purpose baselines (m, t) produce no category trait
+        for itype in ("m6g.large", "m5.xlarge", "t3.micro", "t4g.small"):
             traits = dict(kx._premium_features(self._story(itype, [])))
             self.assertFalse(any("family" in k for k in traits), itype)
+
+    def test_compute_optimized_flagged(self):
+        # c is a resource-specialized category, not a general-purpose baseline
+        traits = dict(kx._premium_features(self._story("c7g.xlarge", [])))
+        self.assertIn("compute optimized family (c7g)", traits)
+        self.assertFalse(traits["compute optimized family (c7g)"])  # not required
+        # a vCPU floor is the tell that compute-optimized was asked for
+        want_cpu = self._story("c7g.xlarge", [
+            {"key": "karpenter.k8s.aws/instance-cpu", "operator": "Gt", "values": ["8"]}])
+        self.assertTrue(dict(kx._premium_features(want_cpu))["compute optimized family (c7g)"])
 
     def test_instance_id(self):
         self.assertEqual(kx.instance_id("aws:///us-east-1b/i-0abc"), "i-0abc")

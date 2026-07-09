@@ -45,8 +45,8 @@ import sys
 from datetime import datetime, timezone, timedelta
 
 # Alpha. Patch number is auto-bumped to 0.1.<commits-on-main> by the
-# pre-commit hook in .githooks (enable once: git config core.hooksPath .githooks)
-__version__ = "0.1.19"
+# version-bump GitHub Action on every push to main. Do not edit by hand.
+__version__ = "0.1.20"
 
 STORE_ROOT = os.environ.get("KEXPLAIN_STORE", os.path.expanduser("~/.kexplain"))
 KARPENTER_NS = os.environ.get("KARPENTER_NAMESPACE", "kube-system")
@@ -583,14 +583,16 @@ SUFFIX_MEANINGS = {
 PROCESSOR_SUFFIXES = frozenset("agi")
 
 # Family category letters (before the generation digit) per the AWS
-# instance-type naming docs. Categories in NOTABLE_CATEGORIES carry a price
-# or capability profile worth flagging in FEATURE ATTRIBUTION; the common
-# general/compute/burstable families (m, c, t) are not flagged.
+# instance-type naming docs. Every resource-specialized family is notable in
+# FEATURE ATTRIBUTION (compute, memory, storage, accelerated, HPC, ...): the
+# question "did you ask for this profile, or did CreateFleet just pick it?"
+# applies equally to all of them. Only the general-purpose baselines
+# (m = general purpose, t = burstable) are treated as unremarkable.
 CATEGORY_MEANINGS = {
     "m": "general purpose", "t": "burstable general purpose",
     "c": "compute optimized", "r": "memory optimized",
     "x": "high memory", "u": "high memory (u family)",
-    "z": "high frequency", "i": "storage optimized (NVMe)",
+    "z": "high frequency memory optimized", "i": "storage optimized (NVMe)",
     "is": "storage optimized", "im": "storage optimized",
     "d": "dense HDD storage", "h": "HDD storage",
     "p": "GPU accelerated (training-class)", "g": "GPU accelerated",
@@ -599,10 +601,8 @@ CATEGORY_MEANINGS = {
     "f": "FPGA accelerated", "vt": "video transcoding",
     "hpc": "HPC optimized", "mac": "Apple macOS",
 }
-NOTABLE_CATEGORIES = frozenset({
-    "r", "x", "u", "z", "i", "is", "im", "d", "h",
-    "p", "g", "gr", "dl", "inf", "trn", "f", "vt", "hpc", "mac",
-})
+GENERAL_PURPOSE_CATEGORIES = frozenset({"m", "t"})
+NOTABLE_CATEGORIES = frozenset(CATEGORY_MEANINGS) - GENERAL_PURPOSE_CATEGORIES
 
 def instance_features(itype):
     """Decode an instance type name per the AWS naming convention:
@@ -1237,19 +1237,24 @@ def _premium_features(s):
 
     traits = []
 
-    # 1. family category (memory-opt, GPU, storage-opt, HPC, ...)
+    # 1. family category (compute-opt, memory-opt, GPU, storage-opt, HPC, ...)
     cat = feats["category"]
     if cat in NOTABLE_CATEGORIES:
+        # an instance-category pin counts as demanding this category only when
+        # it narrows away the general-purpose baselines and lands on this one
         cat_required = family_pinned or any(
             r["key"] == "karpenter.k8s.aws/instance-category"
             and r.get("operator") == "In"
-            and set(r.get("values", [])) - {"c", "m", "t"} == {cat[0]}
+            and set(r.get("values", [])) - GENERAL_PURPOSE_CATEGORIES == {cat[0]}
             for r in claim_reqs)
         if cat in GPU_CATEGORIES:
             cat_required = cat_required or any(k in req_keys for k in GPU_REQ_KEYS)
-        if cat in ("r", "x", "u"):
+        if cat in ("r", "x", "u", "z"):  # memory-optimized profiles
             cat_required = cat_required or \
                 "karpenter.k8s.aws/instance-memory" in req_keys
+        if cat == "c":  # compute-optimized: a high vCPU floor is the tell
+            cat_required = cat_required or \
+                "karpenter.k8s.aws/instance-cpu" in req_keys
         label = f'{CATEGORY_MEANINGS.get(cat, cat)} family ({feats["family"]})'
         traits.append((label, attributed(cat_required)))
 
