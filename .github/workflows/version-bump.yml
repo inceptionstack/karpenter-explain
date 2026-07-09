@@ -1,0 +1,32 @@
+name: version-bump
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: bump version to 0.1.<commit-count> when a commit lands unbumped
+        run: |
+          count=$(git rev-list --count HEAD)
+          current=$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' kexplain.py)
+          if [ "$current" = "0.1.${count}" ]; then
+            echo "version ${current} matches commit count, nothing to do"
+            exit 0
+          fi
+          # the bump commit itself raises the count by one
+          target="0.1.$((count + 1))"
+          sed -i "s/^__version__ = \".*\"\$/__version__ = \"${target}\"/" kexplain.py
+          git config user.name "royosherove"
+          git config user.email "royosherove@users.noreply.github.com"
+          git add kexplain.py
+          git commit -m "bump version to ${target}"
+          git push
+          echo "bumped ${current} -> ${target}"
