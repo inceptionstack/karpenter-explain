@@ -101,3 +101,8 @@ explicitly asking.
 - Before pushing: `python3 -m unittest discover tests` must pass and
   `grep -rnP '\x{2014}' $(git ls-files)` (the em-dash gate) must come back
   empty. CI enforces both.
+- Local quality gate: enable the pre-commit hook once per clone with
+  `git config core.hooksPath .githooks`. It runs the syntax check, the unit
+  tests, and the em-dash gate before each commit, so a bad commit is caught
+  locally instead of in CI. It does not touch the version (the Action owns
+  that).

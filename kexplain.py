@@ -46,7 +46,7 @@ from datetime import datetime, timezone, timedelta
 
 # Alpha. Patch number is auto-bumped to 0.1.<commits-on-main> by the
 # version-bump GitHub Action on every push to main. Do not edit by hand.
-__version__ = "0.1.20"
+__version__ = "0.1.21"
 
 STORE_ROOT = os.environ.get("KEXPLAIN_STORE", os.path.expanduser("~/.kexplain"))
 KARPENTER_NS = os.environ.get("KARPENTER_NAMESPACE", "kube-system")

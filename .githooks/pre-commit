@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Local quality gate: block a commit that would not pass CI.
+# Enable once per clone:  git config core.hooksPath .githooks
+# (Version bumping is NOT done here; the version-bump GitHub Action owns it.)
+set -euo pipefail
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+echo "pre-commit: syntax check"
+python3 -m py_compile kexplain.py
+
+echo "pre-commit: unit tests"
+python3 -m unittest discover tests >/dev/null
+
+echo "pre-commit: em-dash gate"
+if grep -rnP '\x{2014}' $(git ls-files) 2>/dev/null; then
+  echo "pre-commit: FAILED - em-dash (U+2014) found above; use plain punctuation" >&2
+  exit 1
+fi
+
+echo "pre-commit: ok"
