@@ -283,6 +283,48 @@ class TestFunnel(unittest.TestCase):
         self.assertNotIn("t3.micro", final)
 
 
+class TestRequirementHelpers(unittest.TestCase):
+    def test_normalize_gt_lt(self):
+        self.assertEqual(kx.normalize_requirement("Gt", ["2"]), ("Gte", ("3",)))
+        self.assertEqual(kx.normalize_requirement("Lt", ["5"]), ("Lte", ("4",)))
+        self.assertEqual(kx.normalize_requirement("In", ["b", "a"]),
+                         ("In", ("a", "b")))
+        # non-numeric values pass through untouched
+        self.assertEqual(kx.normalize_requirement("Gt", ["abc"]),
+                         ("Gt", ("abc",)))
+
+    def test_same_requirement(self):
+        a = {"operator": "In", "values": ["x", "y"]}
+        b = {"operator": "In", "values": ["y", "x"]}
+        c = {"operator": "In", "values": ["x"]}
+        self.assertTrue(kx.same_requirement(a, b))
+        self.assertFalse(kx.same_requirement(a, c))
+        self.assertFalse(kx.same_requirement(a, None))
+
+    def test_collect_constraints_provenance(self):
+        pool = {"metadata": {"name": "default"},
+                "spec": {"template": {"spec": {"requirements": [
+                    {"key": "kubernetes.io/os", "operator": "In", "values": ["linux"]},
+                    {"key": "kubernetes.io/arch", "operator": "In",
+                     "values": ["amd64", "arm64"]},
+                ]}}}}
+        s = kx.NodeStory("nc")
+        s.raw_claim = {"spec": {"requirements": [
+            {"key": "karpenter.sh/nodepool", "operator": "In", "values": ["default"]},
+            {"key": "kubernetes.io/arch", "operator": "In",
+             "values": ["arm64", "amd64"]},  # same as pool, reordered
+            {"key": "karpenter.sh/capacity-type", "operator": "In",
+             "values": ["spot"]},  # pod-injected
+        ]}}
+        got = kx.collect_constraints(s, pool)
+        sources = [(src, r["key"]) for src, r in got]
+        # os is internal, arch dedups against the pool, capacity-type is pod's
+        self.assertEqual(sources, [
+            ("NodePool default", "kubernetes.io/arch"),
+            ("pod constraints", "karpenter.sh/capacity-type"),
+        ])
+
+
 class TestReplacementLinking(unittest.TestCase):
     def test_replacement_nodeclaim_links_to_disruption(self):
         logs = list(FIXTURE_LOGS)

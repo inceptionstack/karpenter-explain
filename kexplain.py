@@ -33,6 +33,33 @@ from datetime import datetime, timezone, timedelta
 STORE_ROOT = os.environ.get("KEXPLAIN_STORE", os.path.expanduser("~/.kexplain"))
 KARPENTER_NS = os.environ.get("KARPENTER_NAMESPACE", "kube-system")
 
+# How much of an instance's raw capacity we assume is schedulable after
+# kubelet/system reservation and daemonsets. Rough heuristics; Karpenter
+# computes exact overhead from instance type at runtime.
+CPU_ALLOCATABLE_RATIO = 0.9
+MEM_ALLOCATABLE_RATIO = 0.85
+
+# A "created nodeclaim" is attributed to the provisioning session or
+# disruption command that happened at most this many seconds before it.
+PROVISION_LINK_WINDOW_S = 60
+REPLACEMENT_LINK_WINDOW_S = 15
+
+EC2_CATALOG_TTL_S = 7 * 24 * 3600
+KARPENTER_LOG_TAIL = 200
+
+# funnel rendering: bar width in characters, and how small the surviving
+# set must be before we list type names / family names under a stage
+FUNNEL_BAR_WIDTH = 30
+FUNNEL_NAME_SURVIVORS_MAX = 12
+FUNNEL_NAME_FAMILIES_MAX = 40
+
+# Requirement keys injected by karpenter itself; not user-meaningful
+# when explaining a decision.
+INTERNAL_REQ_KEYS = frozenset({
+    "karpenter.sh/nodepool", "karpenter.k8s.aws/ec2nodeclass",
+    "kubernetes.io/os",
+})
+
 # ---------------------------------------------------------------- utilities
 
 def sh(cmd, check=True, timeout=120):
@@ -96,6 +123,16 @@ def print_logo(subtitle=""):
     )
     print(cyan(art))
     print(dim(f"  an EXPLAIN plan for Karpenter{('  |  ' + subtitle) if subtitle else ''}\n"))
+
+def status(msg=None):
+    """Transient one-line progress message; each call replaces the previous
+    one, and status() with no argument clears it. No-op when piped."""
+    if not sys.stdout.isatty():
+        return
+    sys.stdout.write("\r\033[2K")
+    if msg:
+        sys.stdout.write(dim(f"  {msg}"))
+    sys.stdout.flush()
 
 # ---------------------------------------------------------------- store
 
@@ -329,12 +366,12 @@ def build_stories(store):
                 s.candidate_count = len(s.candidate_types) + extra
             # attach the most recent provisioning session within 60s
             for sts, pods, _ in reversed(sessions):
-                if sts and ts and 0 <= (ts - sts).total_seconds() <= 60:
+                if sts and ts and 0 <= (ts - sts).total_seconds() <= PROVISION_LINK_WINDOW_S:
                     s.trigger_pods = [p.strip() for p in pods.split(",") if p.strip()]
                     break
             # or: was this nodeclaim created as a consolidation replacement?
             for rts, rnames, rreason, rsav in reversed(replace_cmds):
-                if rts and ts and 0 <= (ts - rts).total_seconds() <= 15:
+                if rts and ts and 0 <= (ts - rts).total_seconds() <= REPLACEMENT_LINK_WINDOW_S:
                     s.replaces = {"nodes": rnames, "reason": rreason, "savings": rsav}
                     break
 
@@ -645,28 +682,10 @@ def build_funnel(store, s, pool):
                      if all(match_requirement(i, r) for r in reqs)}
         stages.append((label, dict(remaining), before - len(remaining)))
 
-    # 1. each NodePool requirement, one stage per requirement
-    pool_reqs = {}
-    if pool:
-        for r in pool["spec"]["template"]["spec"].get("requirements", []):
-            if r["key"] == "kubernetes.io/os":
-                continue
-            pool_reqs[r["key"]] = r
-            apply(f'NodePool: {requirement_str(r)}', [r])
-
-    # 2. pod-injected requirements (claim reqs narrower than the pool's)
-    claim_reqs = (s.raw_claim or {}).get("spec", {}).get("requirements", [])
-    for r in claim_reqs:
-        key = r["key"]
-        if key in ("karpenter.sh/nodepool", "karpenter.k8s.aws/ec2nodeclass",
-                   "kubernetes.io/os", "node.kubernetes.io/instance-type",
-                   "topology.kubernetes.io/zone"):
-            continue
-        pr = pool_reqs.get(key)
-        if pr and pr.get("operator") == r.get("operator") and \
-           sorted(pr.get("values", [])) == sorted(r.get("values", [])):
-            continue  # identical to pool stage, already applied
-        apply(f'pod constraint: {requirement_str(r)}', [r])
+    # one stage per constraint: pool requirements first, then pod-injected
+    for source, r in collect_constraints(s, pool):
+        label = "NodePool" if source.startswith("NodePool") else "pod constraint"
+        apply(f'{label}: {requirement_str(r)}', [r])
 
     # 3. resource fit (aggregated requests must fit with system overhead)
     reqs = s.requests if isinstance(s.requests, dict) else None
@@ -675,8 +694,8 @@ def build_funnel(store, s, pool):
         mem = parse_quantity(reqs.get("memory", 0))
         before = len(remaining)
         remaining = {n: i for n, i in remaining.items()
-                     if (not cpu or i["cpu"] * 0.9 >= cpu) and
-                        (not mem or i["memory_mib"] * 2**20 * 0.85 >= mem)}
+                     if (not cpu or i["cpu"] * CPU_ALLOCATABLE_RATIO >= cpu) and
+                        (not mem or i["memory_mib"] * 2**20 * MEM_ALLOCATABLE_RATIO >= mem)}
         stages.append((f'resource fit: cpu≥{reqs.get("cpu")}, mem≥{reqs.get("memory")}'
                        f' (after ~10-15% system overhead)',
                        dict(remaining), before - len(remaining)))
@@ -686,16 +705,16 @@ def render_funnel(stages, s, L):
     """Append funnel stages to the explain tree lines."""
     L.append((1, bold("FUNNEL") + dim("  (recomputed from the live EC2 catalog)")))
     width0 = len(stages[0][1]) or 1
-    BAR = 30
+    BAR = FUNNEL_BAR_WIDTH
     for label, remaining, eliminated in stages:
         n = len(remaining)
         bar = "█" * max(1, int(BAR * n / width0)) if n else "·"
         drop = red(f'  −{eliminated}') if eliminated else ""
         L.append((2, f'{dim(bar.ljust(BAR))} {bold(str(n).rjust(4))}  {label}{drop}'))
         # name survivors when the set gets small
-        if 0 < n <= 12 and eliminated:
+        if 0 < n <= FUNNEL_NAME_SURVIVORS_MAX and eliminated:
             L.append((3, dim(", ".join(sorted(remaining)))))
-        elif eliminated and n <= 40:
+        elif eliminated and n <= FUNNEL_NAME_FAMILIES_MAX:
             fams = sorted({i["family"] for i in remaining.values()})
             L.append((3, dim(f'families: {", ".join(fams)}')))
     # reconciliation with what karpenter itself reported
@@ -706,31 +725,50 @@ def render_funnel(stages, s, L):
         L.append((2, dim(f'karpenter itself reported {s.candidate_count} candidates ({note})')))
     if s.instance_type:
         bar = "▏"
-        L.append((2, f'{dim(bar.ljust(30))} {bold("   1")}  '
+        L.append((2, f'{dim(bar.ljust(FUNNEL_BAR_WIDTH))} {bold("   1")}  '
                      f'CreateFleet picks: {green(bold(s.instance_type))} '
                      f'({s.capacity_type}, {s.zone})'))
 
+# claim requirements that either duplicate karpenter bookkeeping or are
+# derived (the resolved type list, the chosen zone) rather than user intent
+CLAIM_SKIP_KEYS = INTERNAL_REQ_KEYS | {
+    "node.kubernetes.io/instance-type", "topology.kubernetes.io/zone",
+}
+
+def same_requirement(a, b):
+    return a and b and a.get("operator") == b.get("operator") and \
+        sorted(a.get("values", [])) == sorted(b.get("values", []))
+
+def normalize_requirement(op, vals):
+    """Canonical (operator, values) form for comparing a NodePool requirement
+    with the claim's: karpenter rewrites Gt n as Gte n+1 and Lt n as Lte n-1
+    when it resolves a nodeclaim."""
+    try:
+        if op == "Gt":
+            return ("Gte", (str(int(vals[0]) + 1),))
+        if op == "Lt":
+            return ("Lte", (str(int(vals[0]) - 1),))
+    except (ValueError, IndexError):
+        pass
+    return (op, tuple(sorted(vals)))
+
 def collect_constraints(s, pool):
     """The full constraint list applied to this nodeclaim, with provenance.
-    Returns [(source, requirement-dict)]."""
+    Returns [(source, requirement-dict)]: NodePool requirements first, then
+    the pod-injected ones (claim requirements narrower than the pool's)."""
     out = []
     pool_reqs = {}
     if pool:
         for r in pool["spec"]["template"]["spec"].get("requirements", []):
-            if r["key"] == "kubernetes.io/os":
+            if r["key"] in INTERNAL_REQ_KEYS:
                 continue
             pool_reqs[r["key"]] = r
             out.append((f'NodePool {pool["metadata"]["name"]}', r))
     for r in (s.raw_claim or {}).get("spec", {}).get("requirements", []):
-        key = r["key"]
-        if key in ("karpenter.sh/nodepool", "karpenter.k8s.aws/ec2nodeclass",
-                   "kubernetes.io/os", "node.kubernetes.io/instance-type",
-                   "topology.kubernetes.io/zone"):
+        if r["key"] in CLAIM_SKIP_KEYS:
             continue
-        pr = pool_reqs.get(key)
-        if pr and pr.get("operator") == r.get("operator") and \
-           sorted(pr.get("values", [])) == sorted(r.get("values", [])):
-            continue
+        if same_requirement(pool_reqs.get(r["key"]), r):
+            continue  # identical to a pool requirement, already listed
         out.append(("pod constraints", r))
     return out
 
@@ -767,12 +805,12 @@ def cmd_why_not(store, s, pool, itype):
     if reqs:
         cpu = parse_quantity(reqs.get("cpu", 0))
         mem = parse_quantity(reqs.get("memory", 0))
-        if cpu and info["cpu"] * 0.9 < cpu:
-            fit_fail = (f'insufficient cpu: {info["cpu"]} vCPU (~{info["cpu"] * 0.9:.1f} '
+        if cpu and info["cpu"] * CPU_ALLOCATABLE_RATIO < cpu:
+            fit_fail = (f'insufficient cpu: {info["cpu"]} vCPU (~{info["cpu"] * CPU_ALLOCATABLE_RATIO:.1f} '
                         f'allocatable) < {reqs.get("cpu")} requested')
-        elif mem and info["memory_mib"] * 2**20 * 0.85 < mem:
+        elif mem and info["memory_mib"] * 2**20 * MEM_ALLOCATABLE_RATIO < mem:
             fit_fail = (f'insufficient memory: {info["memory_mib"] / 1024:.1f} GiB '
-                        f'(~{info["memory_mib"] * 0.85 / 1024:.1f} allocatable) '
+                        f'(~{info["memory_mib"] * MEM_ALLOCATABLE_RATIO / 1024:.1f} allocatable) '
                         f'< {reqs.get("memory")} requested')
 
     if failures or fit_fail:
@@ -890,25 +928,13 @@ def cmd_explain(store, args):
         L.append((2, f'NodePool: {s.nodepool} (spec not in store)'))
     if s.raw_claim:
         creqs = s.raw_claim["spec"].get("requirements", [])
-        skip_keys = {"karpenter.sh/nodepool", "karpenter.k8s.aws/ec2nodeclass",
-                     "kubernetes.io/os"}
-        interesting = [r for r in creqs if r["key"] not in skip_keys]
+        interesting = [r for r in creqs if r["key"] not in INTERNAL_REQ_KEYS]
         # which requirements were injected by pod scheduling constraints
         # (i.e. not present with the same values in the NodePool template)?
-        def norm(op, vals):
-            # karpenter normalizes Gt n → Gte n+1 and Lt n → Lte n-1 in nodeclaims
-            try:
-                if op == "Gt":
-                    return ("Gte", (str(int(vals[0]) + 1),))
-                if op == "Lt":
-                    return ("Lte", (str(int(vals[0]) - 1),))
-            except (ValueError, IndexError):
-                pass
-            return (op, tuple(sorted(vals)))
         pool_reqs = {}
         if pool:
             for r in pool["spec"]["template"]["spec"].get("requirements", []):
-                pool_reqs[r["key"]] = norm(r.get("operator"), r.get("values", []))
+                pool_reqs[r["key"]] = normalize_requirement(r.get("operator"), r.get("values", []))
         if interesting:
             L.append((2, 'Resolved NodeClaim requirements (NodePool ∩ pod constraints):'))
             for r in interesting:
@@ -916,7 +942,8 @@ def cmd_explain(store, args):
                 if r["key"] == "node.kubernetes.io/instance-type" and len(r.get("values", [])) > 6:
                     txt = f'node.kubernetes.io/instance-type in [{len(r["values"])} types]'
                 pr = pool_reqs.get(r["key"])
-                from_pod = pool_reqs and pr != norm(r.get("operator"), r.get("values", [])) \
+                from_pod = pool_reqs and \
+                    pr != normalize_requirement(r.get("operator"), r.get("values", [])) \
                     and r["key"] != "node.kubernetes.io/instance-type"
                 if from_pod:
                     txt += yellow("   ← narrowed by pod constraints")
@@ -1082,7 +1109,7 @@ def _parse_bandwidth(perf):
 def ec2_catalog(store):
     cache = os.path.join(store.dir, "ec2-catalog-v2.json")
     if os.path.exists(cache) and \
-       (datetime.now().timestamp() - os.path.getmtime(cache)) < 86400 * 7:
+       (datetime.now().timestamp() - os.path.getmtime(cache)) < EC2_CATALOG_TTL_S:
         with open(cache) as f:
             return json.load(f)
     print(dim("  fetching EC2 instance type catalog (cached 7 days)…"))
@@ -1250,9 +1277,9 @@ def cmd_plan(store, args):
                 continue
             if all(match_requirement(info, r) for r in reqs):
                 # must also fit the pod (leave ~10% headroom for daemonsets/system)
-                if cpu_req and info["cpu"] * 1000 * 0.9 < cpu_req * 1000:
+                if cpu_req and info["cpu"] * 1000 * CPU_ALLOCATABLE_RATIO < cpu_req * 1000:
                     continue
-                if mem_req and info["memory_mib"] * 2**20 * 0.85 < mem_req:
+                if mem_req and info["memory_mib"] * 2**20 * MEM_ALLOCATABLE_RATIO < mem_req:
                     continue
                 matches.append((name, info))
         # pod-level conflict check
@@ -1338,8 +1365,8 @@ def cmd_wizard(store, args):
                  "(see AGENTS.md)")
 
     # health check first, so investigations start from a known-good setup
-    print(dim("  checking your setup..."))
-    ok, checks = run_checks()
+    ok, checks = run_checks(progress=status)
+    status()
     if ok:
         soft = [c for c in checks if not c["ok"]]
         line = green("  ✓ setup looks good")
@@ -1464,16 +1491,22 @@ def preflight():
 
 OPTIONAL_CHECKS = ("aws ec2 access", "debug logging")
 
-def run_checks():
+def run_checks(progress=None):
     """Gather every prerequisite check. Returns (ok, checks) where ok ignores
-    the optional ones. Pure data, no printing, no exiting."""
+    the optional ones. Pure data, no printing, no exiting. `progress` is an
+    optional callable(str) invoked before each slow check."""
     checks = []
 
     def check(name, ok, detail, fix=None):
         checks.append({"check": name, "ok": bool(ok), "detail": detail,
                        **({"fix": fix} if fix and not ok else {})})
 
+    def step(msg):
+        if progress:
+            progress(msg)
+
     # kubectl present
+    step("checking kubectl...")
     try:
         v = sh("kubectl version --client -o json", timeout=15)
         check("kubectl", True, json.loads(v)["clientVersion"]["gitVersion"])
@@ -1482,6 +1515,7 @@ def run_checks():
               "install kubectl and put it on PATH")
 
     # cluster reachable
+    step("checking cluster access...")
     cluster = None
     try:
         ctx = sh("kubectl config current-context", timeout=15).strip()
@@ -1494,6 +1528,7 @@ def run_checks():
 
     # karpenter installed, and is debug logging on
     if cluster:
+        step("checking karpenter...")
         try:
             pods = kubectl_json(f"get pods -n {KARPENTER_NS} "
                                 f"-l app.kubernetes.io/name=karpenter")["items"]
@@ -1511,6 +1546,7 @@ def run_checks():
         except Exception as ex:
             check("karpenter", False, str(ex)[:120])
 
+        step("checking nodepools...")
         try:
             pools = kubectl_json("get nodepools")["items"]
             check("nodepools", len(pools) > 0,
@@ -1522,9 +1558,10 @@ def run_checks():
             check("nodepools", False, str(ex)[:120],
                   "karpenter CRDs missing? is karpenter v1.x installed?")
 
+        step("checking log level...")
         try:
             logs = sh(f"kubectl logs -n {KARPENTER_NS} "
-                      f"-l app.kubernetes.io/name=karpenter --tail=200", timeout=30)
+                      f"-l app.kubernetes.io/name=karpenter --tail={KARPENTER_LOG_TAIL}", timeout=30)
             has_debug = '"DEBUG"' in logs
             check("debug logging", has_debug,
                   "DEBUG lines present" if has_debug else
@@ -1534,6 +1571,7 @@ def run_checks():
             pass
 
     # aws cli + read-only EC2 access (optional but recommended)
+    step("checking aws access...")
     try:
         sh("aws sts get-caller-identity", timeout=20)
         try:
@@ -1639,22 +1677,28 @@ def main():
         cmd_doctor(None, args)
         return
 
+    # show the banner before any slow work so the tool never looks stuck
+    print_logo(args.cmd if args.cmd != "wizard" else "interactive investigation")
+
     # preflight: if the basics are broken, fall through to doctor instead of
     # failing with a stack trace mid-command
+    status("connecting to cluster...")
     problem = preflight()
     if problem:
+        status()
         print(red(f"\n  preflight failed: {problem}"))
         print(dim("  running kexplain doctor for the full picture:\n"))
         cmd_doctor(None, argparse.Namespace(json=False))
         return  # doctor sys.exits with its own code
 
-    print_logo(args.cmd if args.cmd != "wizard" else "interactive investigation")
     store = Store(current_cluster())
     if args.cmd not in ("sync",) and not args.no_sync:
+        status("harvesting karpenter logs and events...")
         try:
             sync(store, quiet=True)
         except Exception as ex:
             print(dim(f"  (sync skipped: {ex})"), file=sys.stderr)
+    status()
 
     if args.cmd == "wizard":
         cmd_wizard(store, args)
