@@ -71,13 +71,48 @@ logging, AWS access, and the local store, with a fix hint for anything
 broken. Regular commands run a fast preflight too, so a missing kubeconfig
 gets you a diagnosis instead of a stack trace.
 
-New to the tool? Just run `kexplain` with no arguments on a terminal: it
-drops you into an interactive wizard that walks through the common
-investigations (expensive node, missing type, cluster timeline, deployment
-planning) with numbered menus.
-
 Agents and scripts: see [AGENTS.md](AGENTS.md) for the non-interactive
 contract (`doctor --json`, exit codes, json surfaces, no-TTY rules).
+
+## The wizard: start here if you are human
+
+Run `kexplain` with no arguments (or `kexplain wizard`) and you get a guided
+investigation instead of a wall of flags:
+
+```
+▌       ▜   ▘
+▙▘█▌▚▘▛▌▐ ▀▌▌▛▌
+▛▖▙▖▞▖▙▌▐▖█▌▌▌▌
+      ▌
+  an EXPLAIN plan for Karpenter  |  interactive investigation
+
+  checking your setup...
+  ✓ setup looks good
+
+  1. Why did I get this specific node / instance type?
+  2. Why did Karpenter pick an expensive / weird instance?
+  3. Why was a type I expected NOT chosen?
+  4. What happened in my cluster recently?
+  5. What would a new deployment get? (before the fact)
+  6. Check my setup (doctor)
+
+What do you want to investigate? [1-6, q to quit]:
+```
+
+The wizard runs the doctor checks on startup, so a broken kubeconfig or a
+missing Karpenter install is caught before you pick an investigation. If
+something required is broken it shows the failing checks with fix hints and
+asks whether to continue. Optional gaps (no AWS credentials, no debug
+logging) are noted in one line and the wizard carries on.
+
+Each flow asks plain questions, lists your nodes with numbered menus (no
+copy-pasting node names), runs the right commands for you, and offers
+follow-ups: for example after explaining an expensive node it offers to
+compare against the type you expected instead. `q` quits at any prompt.
+
+Everything the wizard does maps to a direct command (`explain`, `history`,
+`plan`, `--why-not`), so once you know the flow you can skip straight to
+those; they are listed in the command reference below.
 
 ## Or: let your AI agent set it up
 
@@ -231,7 +266,7 @@ The store lives in `~/.kexplain/<cluster>/` (override with `KEXPLAIN_STORE`).
 It contains node names, private IPs, and instance IDs, so treat it like your
 kubeconfig. See [SECURITY.md](SECURITY.md).
 
-## How it works, and honest limitations
+## How it works, and limitations
 
 kexplain reconstructs Karpenter's actual pipeline (pending pods, requirement
 intersection, instance-type filtering, EC2 CreateFleet, lifecycle,

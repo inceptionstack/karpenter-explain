@@ -1337,6 +1337,25 @@ def cmd_wizard(store, args):
                  "direct commands instead: kexplain nodes/history/explain "
                  "(see AGENTS.md)")
 
+    # health check first, so investigations start from a known-good setup
+    print(dim("  checking your setup..."))
+    ok, checks = run_checks()
+    if ok:
+        soft = [c for c in checks if not c["ok"]]
+        line = green("  ✓ setup looks good")
+        if soft:
+            line += yellow(f'  ({", ".join(c["check"] for c in soft)} missing, '
+                           f'some detail will be reduced)')
+        print(line + "\n")
+    else:
+        render_checks(ok, checks)
+        cont = ask("Setup has problems. Continue anyway?", [
+            ("Fix things first, exit the wizard", False),
+            ("Continue with reduced functionality", True),
+        ], default=0)
+        if not cont:
+            sys.exit(3)
+
     stories = build_stories(store)
 
     while True:
@@ -1443,9 +1462,11 @@ def preflight():
         return "cannot list pods (RBAC?)"
     return None
 
-def cmd_doctor(store, args):
-    """Check every prerequisite and report what works, what doesn't, and how
-    to fix it. --json gives agents a machine-readable version."""
+OPTIONAL_CHECKS = ("aws ec2 access", "debug logging")
+
+def run_checks():
+    """Gather every prerequisite check. Returns (ok, checks) where ok ignores
+    the optional ones. Pure data, no printing, no exiting."""
     checks = []
 
     def check(name, ok, detail, fix=None):
@@ -1539,21 +1560,29 @@ def cmd_doctor(store, args):
         check("local store", False, str(ex)[:120],
               "set KEXPLAIN_STORE to a writable directory")
 
-    optional = ("aws ec2 access", "debug logging")
-    ok = all(c["ok"] for c in checks if c["check"] not in optional)
+    ok = all(c["ok"] for c in checks if c["check"] not in OPTIONAL_CHECKS)
+    return ok, checks
+
+def render_checks(ok, checks):
+    print()
+    for c in checks:
+        mark = green("✓") if c["ok"] else \
+               (yellow("!") if c["check"] in OPTIONAL_CHECKS else red("✗"))
+        print(f'  {mark} {bold(c["check"].ljust(16))} {c["detail"]}')
+        if not c["ok"] and c.get("fix"):
+            print(f'      {dim("fix: " + c["fix"])}')
+    print()
+    print(green("ready to explain") if ok else
+          red("fix the failing checks above (aws / debug-logging are optional)"))
+
+def cmd_doctor(store, args):
+    """Check every prerequisite and report what works, what doesn't, and how
+    to fix it. --json gives agents a machine-readable version."""
+    ok, checks = run_checks()
     if args.json:
         print(json.dumps({"ok": ok, "checks": checks}, indent=2))
     else:
-        print()
-        for c in checks:
-            mark = green("✓") if c["ok"] else \
-                   (yellow("!") if c["check"] in optional else red("✗"))
-            print(f'  {mark} {bold(c["check"].ljust(16))} {c["detail"]}')
-            if not c["ok"] and c.get("fix"):
-                print(f'      {dim("fix: " + c["fix"])}')
-        print()
-        print(green("ready to explain") if ok else
-              red("fix the failing checks above (aws / debug-logging are optional)"))
+        render_checks(ok, checks)
     sys.exit(0 if ok else 3)
 
 # ---------------------------------------------------------------- main
