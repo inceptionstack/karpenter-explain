@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kexplain"
+version = "0.1.0"
+description = "An EXPLAIN plan for Karpenter: trace why each node was provisioned"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.8"
+authors = [{ name = "royosherove" }]
+keywords = ["karpenter", "kubernetes", "eks", "aws", "explain"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Systems Administration",
+]
+
+[project.urls]
+Homepage = "https://github.com/inceptionstack/karpenter-explain"
+
+[project.scripts]
+kexplain = "kexplain:main"
+
+[tool.setuptools]
+py-modules = ["kexplain"]

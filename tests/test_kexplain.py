@@ -13,7 +13,7 @@ import unittest
 from datetime import datetime, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TOOL = os.path.join(HERE, "..", "kexplain")
+TOOL = os.path.join(HERE, "..", "kexplain.py")
 
 loader = importlib.machinery.SourceFileLoader("kexplain", TOOL)
 spec = importlib.util.spec_from_loader("kexplain", loader)

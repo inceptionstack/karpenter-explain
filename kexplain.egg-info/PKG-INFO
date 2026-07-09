@@ -1,3 +1,42 @@
+Metadata-Version: 2.4
+Name: kexplain
+Version: 0.1.0
+Summary: An EXPLAIN plan for Karpenter: trace why each node was provisioned
+Author: royosherove
+License: MIT License
+        
+        Copyright (c) 2026 kexplain contributors
+        
+        Permission is hereby granted, free of charge, to any person obtaining a copy
+        of this software and associated documentation files (the "Software"), to deal
+        in the Software without restriction, including without limitation the rights
+        to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+        copies of the Software, and to permit persons to whom the Software is
+        furnished to do so, subject to the following conditions:
+        
+        The above copyright notice and this permission notice shall be included in all
+        copies or substantial portions of the Software.
+        
+        THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+        IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+        FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+        AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+        LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+        OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+        SOFTWARE.
+        
+Project-URL: Homepage, https://github.com/inceptionstack/karpenter-explain
+Keywords: karpenter,kubernetes,eks,aws,explain
+Classifier: Environment :: Console
+Classifier: Intended Audience :: System Administrators
+Classifier: Operating System :: POSIX
+Classifier: Programming Language :: Python :: 3
+Classifier: Topic :: System :: Systems Administration
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Dynamic: license-file
+
 # kexplain
 
 kexplain answers "why did Karpenter give me this node?" the way SQL EXPLAIN
@@ -71,30 +110,9 @@ everything still works except prices and the funnel/plan/why-not catalog.
 
 ## Install
 
-Pick whichever you like; the tool is a single stdlib-only Python file either way.
-
 ```bash
-# pipx / uvx, straight from GitHub (recommended)
-pipx install git+https://github.com/inceptionstack/karpenter-explain
-# or run without installing:
-uvx --from git+https://github.com/inceptionstack/karpenter-explain kexplain doctor
-
-# pip
-pip install --user git+https://github.com/inceptionstack/karpenter-explain
-
-# no python packaging at all: it is one file
-curl -fsSLo ~/.local/bin/kexplain \
-  https://raw.githubusercontent.com/inceptionstack/karpenter-explain/main/kexplain.py
-chmod +x ~/.local/bin/kexplain
-
-# from a clone
-git clone https://github.com/inceptionstack/karpenter-explain && cd karpenter-explain
-pip install --user .
-```
-
-Then:
-
-```bash
+git clone <this-repo> && cd karpenter-explain
+cp kexplain ~/.local/bin/        # or anywhere on PATH
 kexplain doctor                  # checks everything and tells you what to fix
 ```
 
@@ -230,8 +248,7 @@ sleep 120 && kexplain history
 ## Repo layout
 
 ```
-kexplain.py              the tool, single-file python, stdlib only
-pyproject.toml           packaging so pipx/pip install works from the repo url
+kexplain                 the tool, single-file python, stdlib only
 tests/                   unit tests (offline, fixture-based): python3 -m unittest discover tests
 AGENTS.md                contract for AI agents and scripts driving the tool
 infra/create-cluster.sh  demo cluster provisioning (eksctl + helm)

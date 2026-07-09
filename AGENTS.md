@@ -8,13 +8,15 @@ kexplain for a user. Everything here is non-interactive and machine-checkable.
 `kexplain` explains Karpenter provisioning decisions: which pods triggered a
 node, which constraints narrowed the choice, what EC2 CreateFleet picked and
 why, and what disruption removed it. Single-file Python 3.8+, stdlib only,
-nothing to pip install.
+no dependencies to install.
 
 ## Setup for a user, step by step
 
 ```bash
 # 1. install (any dir on PATH)
-cp kexplain ~/.local/bin/ && chmod +x ~/.local/bin/kexplain
+pipx install git+https://github.com/inceptionstack/karpenter-explain
+# or: pip install --user git+https://github.com/inceptionstack/karpenter-explain
+# or copy the single file: cp kexplain.py ~/.local/bin/kexplain && chmod +x ~/.local/bin/kexplain
 
 # 2. point kubectl at the user's cluster
 aws eks update-kubeconfig --name <cluster> --region <region>
@@ -84,7 +86,7 @@ explicitly asking.
 
 ## Development
 
-- Code lives in the single `kexplain` file, organized by section markers
+- Code lives in the single `kexplain.py` file, organized by section markers
   (`# --- store`, `# --- decision model`, `# --- commands`, ...).
 - Tests: `python3 -m unittest discover tests`. They run offline against
   fixtures captured from a real Karpenter v1.13 cluster; no cluster or AWS
