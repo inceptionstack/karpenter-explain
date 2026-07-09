@@ -15,8 +15,11 @@ $ kexplain explain ip-192-168-43-145.ec2.internal
 
 NODE ip-192-168-43-145.ec2.internal  nodeclaim=default-8bk6c  [RUNNING]
 ├─ TRIGGER  @ 2026-07-09 09:56:18Z
-│  └─ 3 unschedulable pod(s) could not fit on existing nodes:
-│     └─ default/expensive-mystery-d68bd97d8-h7qzj …
+│  ├─ 3 unschedulable pod(s) could not fit on existing nodes:
+│  │  └─ default/expensive-mystery-d68bd97d8-h7qzj …
+│  └─ why they did not fit (from kube-scheduler FailedScheduling events):
+│     ├─ Insufficient cpu (x14)
+│     └─ didn't match Pod's node affinity/selector (x6)
 ├─ CONSTRAINTS
 │  ├─ NodePool default requirements: …
 │  └─ Resolved NodeClaim requirements (NodePool ∩ pod constraints):
@@ -29,8 +32,8 @@ NODE ip-192-168-43-145.ec2.internal  nodeclaim=default-8bk6c  [RUNNING]
 │  ├─ ████                            187  pod constraint: cpu-manufacturer = intel  −122
 │  ├─ ███                             173  resource fit: cpu≥3350m, mem≥8448Mi  −14
 │  └─ ▏                                 1  CreateFleet picks: m5d.xlarge (on-demand, us-east-1b)
-├─ FEATURE ATTRIBUTION
-│  └─ local NVMe storage ('d' variant): explicitly required by a scheduling constraint
+├─ FEATURE ATTRIBUTION  (notable traits of the chosen type: asked for, or just picked?)
+│  └─ local NVMe instance storage ('d' variant): explicitly required by a scheduling constraint
 ├─ LIFECYCLE
 │  └─ created → launched (+3s) → registered (+19s) → initialized (+14s)
 └─ DISRUPTION
@@ -157,9 +160,14 @@ NodeClaims that get deleted with their nodes, and events that expire after an
 hour. kexplain saves all three into a local store every time you run it, so
 you can still explain a node that was consolidated away days ago.
 
-- "Why do I keep getting expensive NVMe / high-network / latest-gen
-  instances?" The FEATURE ATTRIBUTION section tells you whether a premium
-  feature was actually required by your constraints, or whether CreateFleet
+- "Why didn't my pods just fit on an existing node?" The TRIGGER section
+  surfaces the kube-scheduler's own FailedScheduling reasons (Insufficient
+  cpu/memory, node affinity/selector mismatch, real taints), so you see what
+  actually blocked placement before Karpenter launched anything.
+- "Why do I keep getting expensive GPU / memory / NVMe / latest-gen
+  instances?" FEATURE ATTRIBUTION decodes the chosen type across the full AWS
+  naming convention (family category and every capability suffix) and tells
+  you, trait by trait, whether your constraints demanded it or CreateFleet
   just picked it. It also tells you how to block it.
 - "Why wasn't the cheap type picked?" Run `--why-not <type>` and you get
   every rule that eliminated it. If nothing eliminated it, you get the
@@ -169,6 +177,9 @@ you can still explain a node that was consolidated away days ago.
   Karpenter calculated.
 - "What will this deployment get?" `plan` simulates the funnel for a pod
   spec before you apply it.
+- Deleted node, gone cluster-side? kexplain still explains it from the local
+  store, and when the NodeClaim spec was never captured it says so honestly
+  ("attribution unknown") rather than guessing.
 
 ## Requirements
 
@@ -194,7 +205,7 @@ everything still works except prices and the funnel/plan/why-not catalog.
 # point kubectl at your cluster
 aws eks update-kubeconfig --name my-cluster
 
-# what Karpenter nodes exist (or existed)?
+# what Karpenter nodes exist (or existed)?  add --json for scripting
 kexplain nodes
 NODECLAIM      NODE                            TYPE         CAPACITY   ZONE        INSTANCE-ID          STATUS     LIFETIME
 default-8bk6c  ip-192-168-43-145.ec2.internal  m5d.xlarge   on-demand  us-east-1b  i-09284…             DISRUPTED  7m33s
@@ -246,12 +257,12 @@ Global flags: `--no-color`, `--no-sync` (skip harvesting). For `explain`:
 
 | Section | Answers |
 |---|---|
-| TRIGGER | Which pending pods started this (and why they did not fit, from FailedScheduling events), or which consolidation command this node replaced |
+| TRIGGER | Which pending pods started this and why they did not fit (from kube-scheduler FailedScheduling events), or which consolidation command this node replaced |
 | CONSTRAINTS | NodePool requirements ∩ pod constraints, with provenance for each narrowed rule |
 | CANDIDATES | How many types survived, per Karpenter's own logs |
 | FUNNEL | The type universe shrinking stage by stage, with counts and survivor names |
 | LAUNCH DECISION | What CreateFleet picked, the allocation strategy, live spot price, "why not cheaper?" |
-| FEATURE ATTRIBUTION | Premium features (NVMe, enhanced network, latest gen): required, or just picked? |
+| FEATURE ATTRIBUTION | Notable traits of the chosen type (family category, NVMe/network/frequency/EBS suffixes, latest gen): required by a constraint, or just picked? |
 | LIFECYCLE | created → launched → registered → initialized latencies |
 | DISRUPTION | The consolidation/drift/expiry decision that removed it, with $/hr savings |
 

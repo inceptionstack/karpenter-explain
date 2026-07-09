@@ -46,7 +46,7 @@ from datetime import datetime, timezone, timedelta
 
 # Alpha. Patch number is auto-bumped to 0.1.<commits-on-main> by the
 # pre-commit hook in .githooks (enable once: git config core.hooksPath .githooks)
-__version__ = "0.1.18"
+__version__ = "0.1.19"
 
 STORE_ROOT = os.environ.get("KEXPLAIN_STORE", os.path.expanduser("~/.kexplain"))
 KARPENTER_NS = os.environ.get("KARPENTER_NAMESPACE", "kube-system")
