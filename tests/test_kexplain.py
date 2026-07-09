@@ -169,6 +169,41 @@ class TestParsing(unittest.TestCase):
         premium = dict(kx._premium_features(s))
         self.assertTrue(premium["local NVMe instance storage ('d' variant)"])
 
+    def _story(self, itype, reqs):
+        s = kx.NodeStory("nc")
+        s.instance_type = itype
+        s.raw_claim = {"spec": {"requirements": reqs}}
+        return s
+
+    def test_gpu_category_attribution(self):
+        with_gpu_req = self._story("g6e.xlarge", [
+            {"key": "karpenter.k8s.aws/instance-gpu-count",
+             "operator": "Gte", "values": ["1"]}])
+        traits = dict(kx._premium_features(with_gpu_req))
+        self.assertTrue(traits["GPU accelerated family (g6e)"])
+        without = dict(kx._premium_features(self._story("g6e.xlarge", [])))
+        self.assertFalse(without["GPU accelerated family (g6e)"])
+
+    def test_memory_category_attribution(self):
+        s = self._story("r7gd.large", [
+            {"key": "karpenter.k8s.aws/instance-memory",
+             "operator": "Gte", "values": ["16384"]}])
+        traits = dict(kx._premium_features(s))
+        self.assertTrue(traits["memory optimized family (r7gd)"])
+
+    def test_accelerator_and_hpc_categories_flagged(self):
+        for itype, key in (("trn1n.32xlarge", "AWS Trainium ML accelerator family (trn1n)"),
+                           ("inf2.xlarge", "AWS Inferentia ML accelerator family (inf2)"),
+                           ("hpc7g.16xlarge", "HPC optimized family (hpc7g)")):
+            traits = dict(kx._premium_features(self._story(itype, [])))
+            self.assertIn(key, traits, itype)
+
+    def test_common_categories_not_flagged(self):
+        # plain m/c/t families produce no category trait
+        for itype in ("m6g.large", "c5.large", "t3.micro"):
+            traits = dict(kx._premium_features(self._story(itype, [])))
+            self.assertFalse(any("family" in k for k in traits), itype)
+
     def test_instance_id(self):
         self.assertEqual(kx.instance_id("aws:///us-east-1b/i-0abc"), "i-0abc")
         self.assertIsNone(kx.instance_id(None))

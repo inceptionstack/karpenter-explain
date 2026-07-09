@@ -530,9 +530,31 @@ SUFFIX_MEANINGS = {
 }
 PROCESSOR_SUFFIXES = frozenset("agi")
 
+# Family category letters (before the generation digit) per the AWS
+# instance-type naming docs. Categories in NOTABLE_CATEGORIES carry a price
+# or capability profile worth flagging in FEATURE ATTRIBUTION; the common
+# general/compute/burstable families (m, c, t) are not flagged.
+CATEGORY_MEANINGS = {
+    "m": "general purpose", "t": "burstable general purpose",
+    "c": "compute optimized", "r": "memory optimized",
+    "x": "high memory", "u": "high memory (u family)",
+    "z": "high frequency", "i": "storage optimized (NVMe)",
+    "is": "storage optimized", "im": "storage optimized",
+    "d": "dense HDD storage", "h": "HDD storage",
+    "p": "GPU accelerated (training-class)", "g": "GPU accelerated",
+    "gr": "GPU accelerated (memory-heavy)", "dl": "deep learning accelerated",
+    "inf": "AWS Inferentia ML accelerator", "trn": "AWS Trainium ML accelerator",
+    "f": "FPGA accelerated", "vt": "video transcoding",
+    "hpc": "HPC optimized", "mac": "Apple macOS",
+}
+NOTABLE_CATEGORIES = frozenset({
+    "r", "x", "u", "z", "i", "is", "im", "d", "h",
+    "p", "g", "gr", "dl", "inf", "trn", "f", "vt", "hpc", "mac",
+})
+
 def instance_features(itype):
     """Decode an instance type name per the AWS naming convention:
-    family letters, generation digit(s), capability suffix letters, and an
+    category letters, generation digit(s), capability suffix letters, and an
     optional -variant (flex, b200, 3tb1, m4pro, ...). Handles the odd
     families too: mac-m4, u-6tb1, c7i-flex, p6-b200, gr6f."""
     fam = itype.split(".")[0]
@@ -540,12 +562,12 @@ def instance_features(itype):
     m = re.match(r"([a-z]+?)(\d+)([a-z]*)$", base)
     if not m:
         # no generation digit at all (e.g. "mac" in mac-m4, "u" in u-3tb1)
-        return {"family": fam, "generation": 0, "suffix": "", "variant": variant,
-                "capabilities": []}
+        return {"family": fam, "category": base, "generation": 0, "suffix": "",
+                "variant": variant, "capabilities": []}
     suffix = m.group(3)
     caps = [SUFFIX_MEANINGS[ch] for ch in suffix
             if ch not in PROCESSOR_SUFFIXES and ch in SUFFIX_MEANINGS]
-    return {"family": fam, "generation": int(m.group(2)),
+    return {"family": fam, "category": m.group(1), "generation": int(m.group(2)),
             "suffix": "".join(ch for ch in suffix if ch not in PROCESSOR_SUFFIXES),
             "variant": variant, "capabilities": caps}
 
@@ -1077,18 +1099,28 @@ def _section_launch(s, args):
 # generation at or above which we flag "latest generation" as premium
 LATEST_GEN_THRESHOLD = 7
 
-# Which karpenter requirement key demands each capability suffix. Suffixes
-# without a matching key (z, e, b, q, f) can only be pinned via
-# instance-family/instance-type requirements, so we check those instead.
+# Which karpenter requirement key demands each capability suffix or
+# category. Traits without a matching key (z, e, b, q, f suffixes) can only
+# be pinned via instance-family/instance-type requirements.
 SUFFIX_REQ_KEYS = {
-    "d": "karpenter.k8s.aws/instance-local-nvme",
-    "n": "karpenter.k8s.aws/instance-network-bandwidth",
+    "d": ("karpenter.k8s.aws/instance-local-nvme",),
+    "n": ("karpenter.k8s.aws/instance-network-bandwidth",),
 }
+GPU_REQ_KEYS = ("karpenter.k8s.aws/instance-gpu-count",
+                "karpenter.k8s.aws/instance-gpu-name",
+                "karpenter.k8s.aws/instance-gpu-manufacturer",
+                "karpenter.k8s.aws/instance-gpu-memory",
+                "karpenter.k8s.aws/instance-accelerator-count",
+                "karpenter.k8s.aws/instance-accelerator-name",
+                "karpenter.k8s.aws/instance-accelerator-manufacturer")
+GPU_CATEGORIES = frozenset({"p", "g", "gr", "dl", "inf", "trn", "f", "vt"})
 
 def _premium_features(s):
-    """Premium features of the chosen type as (label, required?) pairs.
-    required? is None when the claim spec is missing from the store, i.e.
-    we cannot know whether a constraint demanded the feature."""
+    """Notable traits of the chosen type (accelerators, memory-optimized,
+    storage-optimized categories; NVMe/network/etc. suffixes; latest
+    generation) as (label, required?) pairs. required? is None when the
+    claim spec is missing from the store, i.e. we cannot know whether a
+    constraint demanded the trait."""
     feats = instance_features(s.instance_type)
     claim_reqs = (s.raw_claim or {}).get("spec", {}).get("requirements", [])
     req_keys = {r["key"] for r in claim_reqs}
@@ -1097,7 +1129,7 @@ def _premium_features(s):
     def attributed(required):
         return required if known else None
 
-    # a family/type pin in the claim covers ANY suffix of the pinned family
+    # a family/type pin in the claim covers ANY trait of the pinned family
     family_pinned = any(
         r["key"] in ("karpenter.k8s.aws/instance-family",
                      "node.kubernetes.io/instance-type")
@@ -1105,23 +1137,42 @@ def _premium_features(s):
         and any(v.split(".")[0] == feats["family"] for v in r.get("values", []))
         for r in claim_reqs)
 
-    premium = []
+    traits = []
+
+    # 1. family category (memory-opt, GPU, storage-opt, HPC, ...)
+    cat = feats["category"]
+    if cat in NOTABLE_CATEGORIES:
+        cat_required = family_pinned or any(
+            r["key"] == "karpenter.k8s.aws/instance-category"
+            and r.get("operator") == "In"
+            and set(r.get("values", [])) - {"c", "m", "t"} == {cat[0]}
+            for r in claim_reqs)
+        if cat in GPU_CATEGORIES:
+            cat_required = cat_required or any(k in req_keys for k in GPU_REQ_KEYS)
+        if cat in ("r", "x", "u"):
+            cat_required = cat_required or \
+                "karpenter.k8s.aws/instance-memory" in req_keys
+        label = f'{CATEGORY_MEANINGS.get(cat, cat)} family ({feats["family"]})'
+        traits.append((label, attributed(cat_required)))
+
+    # 2. capability suffix letters (d, n, e, z, b, q, f)
     for ch in feats["suffix"]:
         meaning = SUFFIX_MEANINGS.get(ch)
-        if not meaning:
+        if not meaning or ch in PROCESSOR_SUFFIXES:
             continue
-        label = f"{meaning} ('{ch}' variant)"
-        specific_key = SUFFIX_REQ_KEYS.get(ch)
-        required = (specific_key in req_keys if specific_key else False) or family_pinned
-        premium.append((label, attributed(required)))
+        specific = SUFFIX_REQ_KEYS.get(ch, ())
+        required = any(k in req_keys for k in specific) or family_pinned
+        traits.append((f"{meaning} ('{ch}' variant)", attributed(required)))
+
+    # 3. latest generation
     if feats["generation"] >= LATEST_GEN_THRESHOLD:
         gen_req = any(r["key"] == "karpenter.k8s.aws/instance-generation" and
                       r.get("operator") in ("Gt", "Gte") and
                       r.get("values") and float(r["values"][0]) >= LATEST_GEN_THRESHOLD - 1
                       for r in claim_reqs)
-        premium.append((f'latest generation (gen {feats["generation"]})',
-                        attributed(gen_req or family_pinned)))
-    return premium
+        traits.append((f'latest generation (gen {feats["generation"]})',
+                       attributed(gen_req or family_pinned)))
+    return traits
 
 def _section_features(s):
     """Premium features of the chosen type: required by a constraint, just
@@ -1129,7 +1180,7 @@ def _section_features(s):
     premium = _premium_features(s)
     if not premium:
         return []
-    L = [(1, bold("FEATURE ATTRIBUTION") + dim("  (premium features of the chosen type)"))]
+    L = [(1, bold("FEATURE ATTRIBUTION") + dim("  (notable traits of the chosen type: asked for, or just picked?)"))]
     for label, required in premium:
         if required is None:
             L.append((2, f'{label}: {yellow("attribution unknown")}. The NodeClaim '
