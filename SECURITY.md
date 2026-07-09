@@ -12,14 +12,14 @@
 
 `~/.kexplain/<cluster>/` contains harvested controller logs, Karpenter-related
 events, and object snapshots. These include **node names, private IPs, pod
-names, and EC2 instance IDs** — infrastructure metadata, not workload data or
+names, and EC2 instance IDs**. That is infrastructure metadata, not workload data or
 secrets. Treat the store directory with the same sensitivity as your
 kubeconfig. It is intentionally kept outside the repo; `.gitignore` also
 blocks it and all `*.jsonl` harvests as a second layer.
 
 ## What must never be committed to this repo
 
-- Harvest stores, logs from provisioning runs (`infra/*.log`) — they contain
+- Harvest stores, logs from provisioning runs (`infra/*.log`), since they contain
   account IDs and instance IDs.
 - Kubeconfigs, AWS credentials, `.env` files, private keys.
 

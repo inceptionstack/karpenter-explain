@@ -1,6 +1,6 @@
 # Workloads with varied constraints to exercise Karpenter's decision-making.
 ---
-# 1. plain burst — lets Karpenter pick anything cheap (likely spot)
+# 1. plain burst: lets Karpenter pick anything cheap (likely spot)
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -26,7 +26,7 @@ spec:
         securityContext:
           allowPrivilegeEscalation: false
 ---
-# 2. arm64-only — forces a graviton decision
+# 2. arm64-only: forces a graviton decision
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -48,7 +48,7 @@ spec:
         resources:
           requests: {cpu: "2", memory: 2Gi}
 ---
-# 3. on-demand only + zone pinned — narrows the candidate set hard
+# 3. on-demand only + zone pinned: narrows the candidate set hard
 apiVersion: apps/v1
 kind: Deployment
 metadata:

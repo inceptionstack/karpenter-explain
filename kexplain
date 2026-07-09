@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-kexplain — an EXPLAIN plan for Karpenter.
+kexplain: an EXPLAIN plan for Karpenter.
 
 Reconstructs, per node, how Karpenter reached its provisioning decision:
 which pending pods triggered it, what constraints were in play, which
@@ -688,7 +688,7 @@ def render_funnel(stages, s, L):
     if s.candidate_count:
         n = len(stages[-1][1])
         note = "matches" if abs(n - s.candidate_count) <= max(3, n // 10) else \
-               "differs — Karpenter also filters by zone offerings & AMI compat"
+               "differs, since Karpenter also filters by zone offerings & AMI compat"
         L.append((2, dim(f'karpenter itself reported {s.candidate_count} candidates ({note})')))
     if s.instance_type:
         bar = "▏"
@@ -786,8 +786,8 @@ def cmd_why_not(store, s, pool, itype):
             print(f'      {yellow(fit_fail)}\n')
         return
 
-    # survived all constraints — so it WAS a candidate
-    print(green(f'  ✓ {itype} passed every constraint — it WAS in the candidate set '
+    # survived all constraints, so it WAS a candidate
+    print(green(f'  ✓ {itype} passed every constraint, so it WAS in the candidate set '
                 f'sent to CreateFleet'))
     cap = s.capacity_type or "on-demand"
     print(f'\n  CreateFleet chose {bold(chosen)} over it. Why:')
@@ -956,7 +956,7 @@ def cmd_explain(store, args):
                     a, p = min(cheaper, key=lambda x: x[1])
                     L.append((2, yellow(
                         f'why not cheaper? {a} spot is ~${p:.4f}/hr vs chosen '
-                        f'~${chosen_p:.4f}/hr — price-capacity-optimized weighs '
+                        f'~${chosen_p:.4f}/hr. price-capacity-optimized weighs '
                         f'interruption risk, not just price')))
                 else:
                     L.append((2, green('chosen type was also the cheapest spot offering among top candidates')))
@@ -990,7 +990,7 @@ def cmd_explain(store, args):
                 if required:
                     L.append((2, f'{label}: {green("explicitly required")} by a scheduling constraint'))
                 else:
-                    L.append((2, f'{label}: {yellow("NOT required by any constraint")} — '
+                    L.append((2, f'{label}: {yellow("NOT required by any constraint")}. '
                                  f'CreateFleet picked it from the {s.candidate_count or "?"}-type '
                                  f'candidate set ({"interruption-risk weighting" if s.capacity_type == "spot" else "it priced lowest at launch"})'))
             if any(not req for _, req in premium):
@@ -1035,7 +1035,7 @@ def cmd_explain(store, args):
         ts, msg = s.disruption_blocked[-1]
         L.append((2, yellow(f'disruption currently blocked: {msg} ({fmt_ts(ts)})')))
     elif live:
-        L.append((2, dim("none — node is running and not marked for disruption")))
+        L.append((2, dim("none. node is running and not marked for disruption")))
     else:
         L.append((2, dim("node is gone; no disruption decision captured in store")))
 
@@ -1251,7 +1251,7 @@ def cmd_plan(store, args):
                     conflict = f'{r["key"]}: pod wants {r["values"]}, pool allows {pr["values"]}'
         print(f'\n  NodePool {bold(pname)}: ', end="")
         if conflict:
-            print(red(f"INCOMPATIBLE — {conflict}"))
+            print(red(f"INCOMPATIBLE: {conflict}"))
             continue
         if not matches:
             print(red("0 instance types fit"))
