@@ -25,12 +25,14 @@ NODE ip-192-168-43-145.ec2.internal  nodeclaim=default-8bk6c  [RUNNING]
 │  └─ Resolved NodeClaim requirements (NodePool ∩ pod constraints):
 │     ├─ karpenter.k8s.aws/instance-local-nvme >= 101   ← narrowed by pod constraints
 │     └─ karpenter.k8s.aws/instance-cpu-manufacturer = intel   ← narrowed by pod constraints
-├─ FUNNEL  (recomputed from the live EC2 catalog)
+├─ FUNNEL  (recomputed from the live EC2 catalog, in Karpenter's filtering order)
 │  ├─ ██████████████████████████████ 1348  EC2 instance types in region
+│  ├─ ██████████████████████████████ 1348  AMI compatibility (EC2NodeClass resolved AMIs)
 │  ├─ ███████████████████████        1045  NodePool: instance-category in [c, m, r]  −303
 │  ├─ ██████                          309  pod constraint: instance-local-nvme >= 101  −718
 │  ├─ ████                            187  pod constraint: cpu-manufacturer = intel  −122
 │  ├─ ███                             173  resource fit: cpu≥3350m, mem≥8448Mi  −14
+│  ├─ ███                             173  offered in us-east-1b
 │  └─ ▏                                 1  CreateFleet picks: m5d.xlarge (on-demand, us-east-1b)
 ├─ FEATURE ATTRIBUTION  (notable traits of the chosen type: asked for, or just picked?)
 │  └─ local NVMe instance storage ('d' variant): explicitly required by a scheduling constraint
@@ -260,7 +262,7 @@ Global flags: `--no-color`, `--no-sync` (skip harvesting). For `explain`:
 | TRIGGER | Which pending pods started this and why they did not fit (from kube-scheduler FailedScheduling events), or which consolidation command this node replaced |
 | CONSTRAINTS | NodePool requirements ∩ pod constraints, with provenance for each narrowed rule |
 | CANDIDATES | How many types survived, per Karpenter's own logs |
-| FUNNEL | The type universe shrinking stage by stage, with counts and survivor names |
+| FUNNEL | The type universe shrinking stage by stage (AMI compatibility, each NodePool + pod requirement, resource fit, zone offerings), with counts and survivor names, in Karpenter's real filtering order |
 | LAUNCH DECISION | What CreateFleet picked, the allocation strategy, live spot price, "why not cheaper?" |
 | FEATURE ATTRIBUTION | Notable traits of the chosen type (family category, NVMe/network/frequency/EBS suffixes, latest gen): required by a constraint, or just picked? |
 | LIFECYCLE | created → launched → registered → initialized latencies |

@@ -46,7 +46,7 @@ from datetime import datetime, timezone, timedelta
 
 # Alpha. Patch number is auto-bumped to 0.1.<commits-on-main> by the
 # version-bump GitHub Action on every push to main. Do not edit by hand.
-__version__ = "0.1.21"
+__version__ = "0.1.22"
 
 STORE_ROOT = os.environ.get("KEXPLAIN_STORE", os.path.expanduser("~/.kexplain"))
 KARPENTER_NS = os.environ.get("KARPENTER_NAMESPACE", "kube-system")
@@ -846,10 +846,71 @@ def requirement_str(req):
         return f"{key} exists"
     return f"{key} {op} {vals}"
 
+def _nodeclass_for(store, s, pool):
+    """The EC2NodeClass snapshot backing this node's NodePool, or None."""
+    ref = ((pool or {}).get("spec", {}).get("template", {}).get("spec", {})
+           .get("nodeClassRef", {}) or {})
+    name = ref.get("name")
+    classes = store.objects("ec2nodeclasses")
+    if name and name in classes:
+        return classes[name]
+    # fall back to the only class if there is exactly one
+    return next(iter(classes.values())) if len(classes) == 1 else None
+
+def ami_compatible_types(cat, nodeclass):
+    """Types kept by AMI compatibility: a type survives if it matches at least
+    one resolved AMI's requirements (Karpenter's provider-side pre-filter,
+    aws/karpenter-provider-aws FilterForNodeClass). Returns None when the
+    node class has no resolved AMIs in the store (nothing to compute against)."""
+    amis = (nodeclass or {}).get("status", {}).get("amis", [])
+    if not amis:
+        return None
+    def type_ok(info):
+        for ami in amis:
+            reqs = ami.get("requirements", [])
+            if all(match_requirement(info, r) for r in reqs):
+                return True
+        return False
+    return {n: i for n, i in cat.items() if type_ok(i)}
+
+def zone_offerings(store, zones):
+    """Set of instance types offered in any of `zones`, from a cached
+    describe-instance-type-offerings. Returns None if we cannot determine it
+    (no zones known, or no AWS access)."""
+    if not zones:
+        return None
+    cache = os.path.join(store.dir, "offerings.json")
+    offerings = {}
+    if os.path.exists(cache) and \
+       (datetime.now().timestamp() - os.path.getmtime(cache)) < EC2_CATALOG_TTL_S:
+        with open(cache) as f:
+            offerings = json.load(f)
+    missing = [z for z in zones if z not in offerings]
+    if missing:
+        for z in missing:
+            try:
+                out = json.loads(sh(
+                    "aws ec2 describe-instance-type-offerings "
+                    "--location-type availability-zone "
+                    f"--filters Name=location,Values={z} --output json", timeout=60))
+                offerings[z] = sorted({o["InstanceType"]
+                                       for o in out.get("InstanceTypeOfferings", [])})
+            except Exception:
+                return None  # no AWS access; skip the stage entirely
+        with open(cache, "w") as f:
+            json.dump(offerings, f)
+    available = set()
+    for z in zones:
+        available.update(offerings.get(z, []))
+    return available
+
 def build_funnel(store, s, pool):
-    """Recompute the constraint funnel: how each requirement shrank the
-    instance-type universe, ending at the type CreateFleet picked.
-    Returns list of (label, remaining_names, eliminated_count) stages."""
+    """Recompute the constraint funnel: how each filter shrank the
+    instance-type universe, ending at the type CreateFleet picked. Mirrors
+    Karpenter's real order: AMI compatibility (provider pre-filter), then
+    NodePool + pod requirements, resource fit, then zone offerings (folded
+    into the scheduler's fits check). Returns list of
+    (label, remaining_names, eliminated_count) stages."""
     try:
         cat = ec2_catalog(store)
     except Exception:
@@ -861,30 +922,44 @@ def build_funnel(store, s, pool):
     remaining = dict(cat)
     stages.append(("EC2 instance types in region", dict(remaining), 0))
 
-    def apply(label, reqs):
+    def keep(label, predicate):
         nonlocal remaining
         before = len(remaining)
-        remaining = {n: i for n, i in remaining.items()
-                     if all(match_requirement(i, r) for r in reqs)}
+        remaining = {n: i for n, i in remaining.items() if predicate(n, i)}
         stages.append((label, dict(remaining), before - len(remaining)))
+
+    # AMI compatibility: provider-side pre-filter, before pod/pool requirements
+    nodeclass = _nodeclass_for(store, s, pool)
+    ami_types = ami_compatible_types(cat, nodeclass)
+    if ami_types is not None:
+        keep("AMI compatibility (EC2NodeClass resolved AMIs)",
+             lambda n, i: n in ami_types)
 
     # one stage per constraint: pool requirements first, then pod-injected
     for source, r in collect_constraints(s, pool):
         label = "NodePool" if source.startswith("NodePool") else "pod constraint"
-        apply(f'{label}: {requirement_str(r)}', [r])
+        keep(f'{label}: {requirement_str(r)}',
+             lambda n, i, _r=r: match_requirement(i, _r))
 
-    # 3. resource fit (aggregated requests must fit with system overhead)
+    # resource fit (aggregated requests must fit with system overhead)
     reqs = s.requests if isinstance(s.requests, dict) else None
     if reqs:
         cpu = parse_quantity(reqs.get("cpu", 0))
         mem = parse_quantity(reqs.get("memory", 0))
-        before = len(remaining)
-        remaining = {n: i for n, i in remaining.items()
-                     if (not cpu or i["cpu"] * CPU_ALLOCATABLE_RATIO >= cpu) and
-                        (not mem or i["memory_mib"] * 2**20 * MEM_ALLOCATABLE_RATIO >= mem)}
-        stages.append((f'resource fit: cpu≥{reqs.get("cpu")}, mem≥{reqs.get("memory")}'
-                       f' (after ~10-15% system overhead)',
-                       dict(remaining), before - len(remaining)))
+        keep(f'resource fit: cpu≥{reqs.get("cpu")}, mem≥{reqs.get("memory")}'
+             f' (after ~10-15% system overhead)',
+             lambda n, i: (not cpu or i["cpu"] * CPU_ALLOCATABLE_RATIO >= cpu) and
+                          (not mem or i["memory_mib"] * 2**20 * MEM_ALLOCATABLE_RATIO >= mem))
+
+    # zone offerings: scheduler folds this into its fits check. Scope to the
+    # node's actual zone if known, else the node class's subnet zones.
+    zones = [s.zone] if s.zone else sorted({
+        sub.get("zone") for sub in
+        (nodeclass or {}).get("status", {}).get("subnets", []) if sub.get("zone")})
+    offered = zone_offerings(store, zones)
+    if offered is not None:
+        zlabel = zones[0] if len(zones) == 1 else f'{len(zones)} zones'
+        keep(f'offered in {zlabel}', lambda n, i: n in offered)
     return stages
 
 def render_funnel(stages, s, L):
@@ -906,8 +981,11 @@ def render_funnel(stages, s, L):
     # reconciliation with what karpenter itself reported
     if s.candidate_count:
         n = len(stages[-1][1])
-        note = "matches" if abs(n - s.candidate_count) <= max(3, n // 10) else \
-               "differs, since Karpenter also filters by zone offerings & AMI compat"
+        if abs(n - s.candidate_count) <= max(3, n // 10):
+            note = "matches"
+        else:
+            note = ("close; residual is instance-type overrides and "
+                    "runtime capacity that only Karpenter sees")
         L.append((2, dim(f'karpenter itself reported {s.candidate_count} candidates ({note})')))
     if s.instance_type:
         bar = "▏"
@@ -1402,7 +1480,7 @@ def _parse_bandwidth(perf):
     return int(float(m.group(1)) * 1000) if m else 0
 
 def ec2_catalog(store):
-    cache = os.path.join(store.dir, "ec2-catalog-v2.json")
+    cache = os.path.join(store.dir, "ec2-catalog-v3.json")
     if os.path.exists(cache) and \
        (datetime.now().timestamp() - os.path.getmtime(cache)) < EC2_CATALOG_TTL_S:
         with open(cache) as f:
@@ -1442,6 +1520,12 @@ def ec2_catalog(store):
                              "amd" if "amd" in manuf else
                              "aws" if "amazon" in manuf or "aws" in manuf else manuf),
             "bandwidth_mbps": _parse_bandwidth(t.get("NetworkInfo", {}).get("NetworkPerformance", "")),
+            # accelerator presence, for matching AMI requirements like
+            # "instance-gpu-count Exists" that gate GPU/inference AMIs
+            "gpu_count": sum(g.get("Count", 0)
+                             for g in (t.get("GpuInfo", {}) or {}).get("Gpus", [])),
+            "accelerator_count": sum(a.get("Count", 0)
+                                     for a in (t.get("InferenceAcceleratorInfo", {}) or {}).get("Accelerators", [])),
         }
     with open(cache, "w") as f:
         json.dump(cat, f)
@@ -1480,6 +1564,14 @@ def match_requirement(info, req):
         actual = info["manufacturer"]
     elif key == "karpenter.k8s.aws/instance-network-bandwidth":
         actual = info["bandwidth_mbps"]
+    elif key in ("karpenter.k8s.aws/instance-gpu-count",
+                 "karpenter.k8s.aws/instance-accelerator-count"):
+        n = info.get("gpu_count", 0) if "gpu" in key else info.get("accelerator_count", 0)
+        if op == "DoesNotExist":
+            return n == 0
+        if op == "Exists":
+            return n > 0
+        actual = n
     elif key == "node.kubernetes.io/instance-type":
         actual = None  # set by caller via name
     else:

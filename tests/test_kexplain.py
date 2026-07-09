@@ -60,19 +60,19 @@ FAKE_CATALOG = {
     "c5.large":    {"family": "c5", "category": "c", "generation": 5,
                     "size": "large", "arch": "amd64", "cpu": 2,
                     "memory_mib": 4096, "spot": True, "od": True,
-                    "nvme_gb": 0, "manufacturer": "intel", "bandwidth_mbps": 10000},
+                    "nvme_gb": 0, "manufacturer": "intel", "bandwidth_mbps": 10000, "gpu_count": 0, "accelerator_count": 0},
     "c5d.large":   {"family": "c5d", "category": "c", "generation": 5,
                     "size": "large", "arch": "amd64", "cpu": 2,
                     "memory_mib": 4096, "spot": True, "od": True,
-                    "nvme_gb": 50, "manufacturer": "intel", "bandwidth_mbps": 10000},
+                    "nvme_gb": 50, "manufacturer": "intel", "bandwidth_mbps": 10000, "gpu_count": 0, "accelerator_count": 0},
     "m6g.xlarge":  {"family": "m6g", "category": "m", "generation": 6,
                     "size": "xlarge", "arch": "arm64", "cpu": 4,
                     "memory_mib": 16384, "spot": True, "od": True,
-                    "nvme_gb": 0, "manufacturer": "aws", "bandwidth_mbps": 10000},
+                    "nvme_gb": 0, "manufacturer": "aws", "bandwidth_mbps": 10000, "gpu_count": 0, "accelerator_count": 0},
     "t3.micro":    {"family": "t3", "category": "t", "generation": 3,
                     "size": "micro", "arch": "amd64", "cpu": 2,
                     "memory_mib": 1024, "spot": True, "od": True,
-                    "nvme_gb": 0, "manufacturer": "intel", "bandwidth_mbps": 5000},
+                    "nvme_gb": 0, "manufacturer": "intel", "bandwidth_mbps": 5000, "gpu_count": 0, "accelerator_count": 0},
 }
 
 
@@ -348,7 +348,7 @@ class TestFunnel(unittest.TestCase):
     def test_stages_shrink(self):
         store = make_store(FIXTURE_LOGS)
         # pre-seed the catalog cache so no AWS call happens
-        with open(os.path.join(store.dir, "ec2-catalog-v2.json"), "w") as f:
+        with open(os.path.join(store.dir, "ec2-catalog-v3.json"), "w") as f:
             json.dump(FAKE_CATALOG, f)
         pool = {"metadata": {"name": "default"},
                 "spec": {"template": {"spec": {"requirements": [
@@ -367,6 +367,43 @@ class TestFunnel(unittest.TestCase):
         # category drops t3, generation Gt 4 drops m6g (gen 6 stays), t3 gone
         final = stages[-1][1]
         self.assertNotIn("t3.micro", final)
+
+    def test_ami_compat_filters_by_arch(self):
+        # an AMI set that only supports arm64 must drop every amd64 type;
+        # a type survives if it matches at least one AMI's requirements
+        nodeclass = {"status": {"amis": [
+            {"id": "ami-arm", "requirements": [
+                {"key": "kubernetes.io/arch", "operator": "In", "values": ["arm64"]}]},
+        ]}}
+        kept = kx.ami_compatible_types(FAKE_CATALOG, nodeclass)
+        self.assertIn("m6g.xlarge", kept)      # arm64
+        self.assertNotIn("c5.large", kept)     # amd64, no matching AMI
+        # no AMIs in the store -> None (nothing to compute against)
+        self.assertIsNone(kx.ami_compatible_types(FAKE_CATALOG, {"status": {}}))
+
+    def test_ami_compat_any_matching_ami_keeps_type(self):
+        nodeclass = {"status": {"amis": [
+            {"id": "ami-arm", "requirements": [
+                {"key": "kubernetes.io/arch", "operator": "In", "values": ["arm64"]}]},
+            {"id": "ami-amd", "requirements": [
+                {"key": "kubernetes.io/arch", "operator": "In", "values": ["amd64"]}]},
+        ]}}
+        kept = kx.ami_compatible_types(FAKE_CATALOG, nodeclass)
+        # both arches covered by some AMI, so nothing is dropped
+        self.assertEqual(set(kept), set(FAKE_CATALOG))
+
+    def test_zone_offerings_union_from_cache(self):
+        store = make_store()
+        with open(os.path.join(store.dir, "offerings.json"), "w") as f:
+            json.dump({"us-east-1a": ["c5.large", "m6g.xlarge"],
+                       "us-east-1b": ["c5.large", "t3.micro"]}, f)
+        # union across the two zones, no AWS call
+        self.assertEqual(kx.zone_offerings(store, ["us-east-1a", "us-east-1b"]),
+                         {"c5.large", "m6g.xlarge", "t3.micro"})
+        self.assertEqual(kx.zone_offerings(store, ["us-east-1a"]),
+                         {"c5.large", "m6g.xlarge"})
+        # no zones -> None (cannot determine)
+        self.assertIsNone(kx.zone_offerings(store, []))
 
 
 class TestRequirementHelpers(unittest.TestCase):
