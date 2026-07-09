@@ -401,6 +401,67 @@ class TestRequirementHelpers(unittest.TestCase):
         ])
 
 
+class TestSchedulingReasons(unittest.TestCase):
+    def test_parses_insufficient_and_affinity(self):
+        msg = ("0/3 nodes are available: 1 Insufficient cpu, 2 node(s) didn't "
+               "match Pod's node affinity/selector. preemption: 0/3 nodes ...")
+        self.assertEqual(kx.scheduling_reasons(msg),
+                         ["Insufficient cpu", "didn't match Pod's node affinity/selector"])
+
+    def test_drops_transient_boot_taints(self):
+        msg = ("0/3 nodes are available: 1 node(s) had untolerated taint "
+               "{node.kubernetes.io/not-ready: }, 2 node(s) didn't match Pod's "
+               "node affinity/selector. preemption: ...")
+        # the not-ready taint is transient boot noise and must be dropped
+        self.assertEqual(kx.scheduling_reasons(msg),
+                         ["didn't match Pod's node affinity/selector"])
+
+    def test_keeps_real_taint(self):
+        msg = ("0/2 nodes are available: 2 node(s) had untolerated taint "
+               "{dedicated: gpu}. preemption: ...")
+        self.assertEqual(kx.scheduling_reasons(msg), ["untolerated taint dedicated"])
+
+    def test_no_match_returns_empty(self):
+        self.assertEqual(kx.scheduling_reasons("something unrelated"), [])
+        self.assertEqual(kx.scheduling_reasons(""), [])
+
+    def test_events_attribute_reasons_to_triggering_node(self):
+        logs = list(FIXTURE_LOGS)
+        store = make_store(logs)
+        store.add_events([
+            {"uid": "e1", "reason": "FailedScheduling", "kind": "Pod",
+             "namespace": "default", "name": "inflate-aaa", "count": 3,
+             "lastTimestamp": "2026-07-09T09:43:08Z",
+             "message": "0/2 nodes are available: 2 Insufficient cpu. preemption: x"},
+            {"uid": "e2", "reason": "FailedScheduling", "kind": "Pod",
+             "namespace": "default", "name": "inflate-bbb", "count": 1,
+             "lastTimestamp": "2026-07-09T09:43:08Z",
+             "message": "0/2 nodes are available: 2 Insufficient cpu. preemption: x"},
+        ])
+        s = kx.build_stories(store)["default-test1"]
+        self.assertIn("default/inflate-aaa", s.trigger_pods)
+        self.assertEqual(s.trigger_reasons, [("Insufficient cpu", 2)])
+
+
+class TestJsonSurfaces(unittest.TestCase):
+    def test_history_events_structured_and_sorted(self):
+        store = make_store(FIXTURE_LOGS)
+        ev = kx._history_events(store)
+        kinds = [e["kind"] for e in ev]
+        # the fixture is one full lifecycle plus a disruption
+        for expected in ("PENDING", "CREATE", "LAUNCH", "REGISTER", "DISRUPT", "DELETE"):
+            self.assertIn(expected, kinds)
+        times = [e["ts"] for e in ev]
+        self.assertEqual(times, sorted(times))
+        create = next(e for e in ev if e["kind"] == "CREATE")
+        self.assertEqual(create["nodeclaim"], "default-test1")
+
+    def test_history_line_renders_every_kind(self):
+        store = make_store(FIXTURE_LOGS)
+        for e in kx._history_events(store):
+            self.assertTrue(kx._history_line(e))  # no kind falls through blank
+
+
 class TestReplacementLinking(unittest.TestCase):
     def test_replacement_nodeclaim_links_to_disruption(self):
         logs = list(FIXTURE_LOGS)

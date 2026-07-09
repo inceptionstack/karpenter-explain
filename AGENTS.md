@@ -49,8 +49,8 @@ you). Use the direct commands:
 |---|---|
 | health check | `kexplain doctor --json` |
 | harvest state (cron this for history retention) | `kexplain sync` |
-| list nodes incl. deleted ones | `kexplain --no-color nodes` |
-| decision timeline | `kexplain --no-color history --since 24` |
+| list nodes incl. deleted ones | `kexplain nodes --json` |
+| decision timeline | `kexplain history --json --since 24` |
 | full trace for a node | `kexplain --no-color explain <target> --json` |
 | why type X was rejected | `kexplain --no-color explain <target> --why-not <type>` |
 | simulate a deployment | `kexplain --no-color plan -f <file>` |
@@ -58,10 +58,10 @@ you). Use the direct commands:
 `<target>` accepts a node name, nodeclaim name, EC2 instance id, or any
 unique prefix.
 
-Always pass `--no-color` when parsing output. `explain --json` returns the
-full story object (timestamps, trigger pods, candidates, disruption).
-`nodes`/`history`/`plan` are text; parse them line-wise or prefer the json
-surfaces.
+`doctor`, `nodes`, `history`, and `explain` all support `--json`; prefer it
+when parsing. `explain --json` returns the full story object (timestamps,
+trigger pods with scheduling reasons, candidates, disruption). `plan` is text
+only. For human-facing text, pass `--no-color`.
 
 Exit codes: 0 success, 1 error (bad target, unparseable file), 3 doctor found
 required checks failing.

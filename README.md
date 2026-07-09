@@ -229,8 +229,8 @@ kexplain plan -f my-deployment.yaml
 
 | Command | What it does |
 |---|---|
-| `kexplain nodes [--live]` | All Karpenter nodes, including disrupted and deleted ones from the store |
-| `kexplain history [--since HOURS]` | Timeline: PENDING → DECIDE → CREATE → LAUNCH → REGISTER → READY → DISRUPT → DELETE |
+| `kexplain nodes [--live] [--json]` | All Karpenter nodes, including disrupted and deleted ones from the store |
+| `kexplain history [--since HOURS] [--json]` | Timeline: PENDING → DECIDE → CREATE → LAUNCH → REGISTER → READY → DISRUPT → DELETE |
 | `kexplain explain <target>` | Full decision trace (sections below) |
 | `kexplain explain <target> --why-not TYPE` | Why a specific type wasn't chosen |
 | `kexplain explain <target> --json` | Machine-readable story |
@@ -246,7 +246,7 @@ Global flags: `--no-color`, `--no-sync` (skip harvesting). For `explain`:
 
 | Section | Answers |
 |---|---|
-| TRIGGER | Which pending pods started this, or which consolidation command this node replaced |
+| TRIGGER | Which pending pods started this (and why they did not fit, from FailedScheduling events), or which consolidation command this node replaced |
 | CONSTRAINTS | NodePool requirements ∩ pod constraints, with provenance for each narrowed rule |
 | CANDIDATES | How many types survived, per Karpenter's own logs |
 | FUNNEL | The type universe shrinking stage by stage, with counts and survivor names |

@@ -46,7 +46,7 @@ from datetime import datetime, timezone, timedelta
 
 # Alpha. Patch number is auto-bumped to 0.1.<commits-on-main> by the
 # pre-commit hook in .githooks (enable once: git config core.hooksPath .githooks)
-__version__ = "0.1.17"
+__version__ = "0.1.18"
 
 STORE_ROOT = os.environ.get("KEXPLAIN_STORE", os.path.expanduser("~/.kexplain"))
 KARPENTER_NS = os.environ.get("KARPENTER_NAMESPACE", "kube-system")
@@ -336,6 +336,7 @@ class NodeStory:
         self.candidate_types = None          # truncated list from logs
         self.candidate_count = None
         self.trigger_pods = []               # [(ns/pod, ...)]
+        self.trigger_reasons = []            # [(reason, count)] why the pods didn't fit
         self.nominated_pods = []
         self.t_created = self.t_launched = self.t_registered = None
         self.t_initialized = self.t_deleted = None
@@ -431,19 +432,65 @@ def _parse_disruption(row, ts, fallback_name):
     }
     return names, disruption
 
+# kube-scheduler taints on nodes that are still booting; not a real reason
+# a pod cannot be placed, so we drop them from the "why didn't it fit" list
+TRANSIENT_TAINTS = ("unregistered", "not-ready", "uninitialized")
+
+def scheduling_reasons(msg):
+    """Extract the human reasons from a FailedScheduling event message, e.g.
+    "0/3 nodes are available: 1 Insufficient cpu, 2 node(s) didn't match
+    Pod's node affinity/selector. preemption: ..." -> ["Insufficient cpu",
+    "didn't match Pod's node affinity/selector"]. Transient boot taints are
+    dropped; the leading per-reason node count is stripped."""
+    m = re.search(r"nodes are available:\s*(.*?)(?:\.?\s*preemption:|$)", msg or "")
+    if not m:
+        return []
+    reasons = []
+    for part in m.group(1).split(","):
+        p = re.sub(r"^\d+\s+", "", part.strip()).rstrip(".")
+        if any(t in p for t in TRANSIENT_TAINTS):
+            continue
+        if "untolerated taint" in p:
+            tm = re.search(r"\{([^:} ]+)", p)
+            p = f"untolerated taint {tm.group(1)}" if tm else p
+        p = p.replace("node(s) ", "").strip()
+        if p:
+            reasons.append(p)
+    return reasons
+
 def _apply_events(stories, events):
-    """Fold karpenter events (nominations, disruption blocks) into stories."""
+    """Fold karpenter events (nominations, disruption blocks) into stories,
+    and attribute FailedScheduling reasons to the nodes their pods triggered."""
+    # map each trigger pod (ns/name) to the story it launched
+    pod_to_story = {}
+    for st in stories.values():
+        for pod in st.trigger_pods:
+            pod_to_story.setdefault(pod, st)
+    reason_counts = {}  # story name -> {reason: count}
+
     for e in events:
         ts = parse_ts(e.get("lastTimestamp"))
-        if e.get("reason") == "Nominated" and e.get("kind") == "Pod":
+        reason = e.get("reason")
+        if reason == "Nominated" and e.get("kind") == "Pod":
             m = re.search(r"nodeclaim/([\w-]+)", e.get("message", ""))
             if m and m.group(1) in stories:
                 stories[m.group(1)].nominated_pods.append(
                     f'{e.get("namespace")}/{e.get("name")}')
-        elif e.get("reason") in ("DisruptionBlocked", "Unconsolidatable"):
+        elif reason in ("DisruptionBlocked", "Unconsolidatable"):
             nm = e.get("name")
             if e.get("kind") == "NodeClaim" and nm in stories:
                 stories[nm].disruption_blocked.append((ts, e.get("message")))
+        elif reason == "FailedScheduling" and e.get("kind") == "Pod":
+            pod = f'{e.get("namespace")}/{e.get("name")}'
+            st = pod_to_story.get(pod)
+            if st:
+                bucket = reason_counts.setdefault(st.name, {})
+                for r in scheduling_reasons(e.get("message")):
+                    bucket[r] = bucket.get(r, 0) + 1
+
+    for name, bucket in reason_counts.items():
+        stories[name].trigger_reasons = sorted(
+            bucket.items(), key=lambda kv: -kv[1])
 
 def _apply_snapshot(s, obj):
     """Fill story gaps from a NodeClaim object snapshot (covers nodeclaims
@@ -602,31 +649,40 @@ def spot_price(itype, az):
 def cmd_nodes(store, args):
     stories = build_stories(store)
     live = live_nodeclaims()
-    live_nodes = {}
-    try:
-        for n in kubectl_json("get nodes -l karpenter.sh/nodepool")["items"]:
-            live_nodes[n["metadata"]["name"]] = n
-    except Exception:
-        pass
 
-    rows = []
-    for name, s in sorted(stories.items(), key=lambda kv: kv[1].t_created or datetime.min.replace(tzinfo=timezone.utc)):
+    ordered = sorted(stories.items(),
+                     key=lambda kv: kv[1].t_created or datetime.min.replace(tzinfo=timezone.utc))
+    records = []
+    for name, s in ordered:
         alive = name in live
         if args.live and not alive:
             continue
-        status = green("RUNNING") if alive else \
-                 (red("DISRUPTED") if s.disruption else dim("GONE"))
-        age = ""
+        state = "RUNNING" if alive else ("DISRUPTED" if s.disruption else "GONE")
+        lifetime_s = None
         if s.t_created:
             end = s.t_deleted or datetime.now(timezone.utc)
-            age = fmt_dur((end - s.t_created).total_seconds())
-        rows.append([
-            name, s.node or "-", s.instance_type or "?", s.capacity_type or "?",
-            s.zone or "?", instance_id(s.provider_id) or "-", status, age,
-        ])
-    if not rows:
+            lifetime_s = int((end - s.t_created).total_seconds())
+        records.append({
+            "nodeclaim": name, "node": s.node, "instance_type": s.instance_type,
+            "capacity_type": s.capacity_type, "zone": s.zone,
+            "instance_id": instance_id(s.provider_id), "status": state,
+            "nodepool": s.nodepool, "lifetime_seconds": lifetime_s,
+        })
+
+    if args.json:
+        print(json.dumps(records, indent=2))
+        return
+    if not records:
         print("no karpenter nodes found (run some workloads, or `kexplain sync`)")
         return
+
+    color = {"RUNNING": green, "DISRUPTED": red, "GONE": dim}
+    rows = [[
+        r["nodeclaim"], r["node"] or "-", r["instance_type"] or "?",
+        r["capacity_type"] or "?", r["zone"] or "?", r["instance_id"] or "-",
+        color[r["status"]](r["status"]),
+        fmt_dur(r["lifetime_seconds"]) if r["lifetime_seconds"] is not None else "",
+    ] for r in records]
     hdr = ["NODECLAIM", "NODE", "TYPE", "CAPACITY", "ZONE", "INSTANCE-ID", "STATUS", "LIFETIME"]
     widths = [max(len(str(r[i])) if not str(r[i]).startswith("\033") else len(re.sub(r"\033\[\d+m", "", str(r[i])))
                   for r in [hdr] + rows) for i in range(len(hdr))]
@@ -642,62 +698,95 @@ def cmd_nodes(store, args):
     for r in rows:
         prow(r)
 
-def cmd_history(store, args):
+def _history_events(store):
+    """All provisioning/disruption events as dicts with ts (datetime), kind,
+    and event-specific fields. Sorted by time. Shared by text and json output."""
     stories = build_stories(store)
-    logs = store.logs()
-    entries = []  # (ts, line)
-
-    for r in logs:
+    ev = []
+    for r in store.logs():
         msg = r.get("message", "")
         ts = parse_ts(r.get("time"))
         if not ts:
             continue
         if msg == "found provisionable pod(s)":
             pods = [p.strip() for p in r.get("Pods", "").split(",") if p.strip()]
-            entries.append((ts, f'{yellow("PENDING")}    {len(pods)} unschedulable pod(s): '
-                                f'{", ".join(pods[:4])}{" …" if len(pods) > 4 else ""}'))
+            ev.append({"ts": ts, "kind": "PENDING", "pods": pods})
         elif msg == "computed new nodeclaim(s) to fit pod(s)":
-            entries.append((ts, f'{cyan("DECIDE")}     fit {r.get("pods")} pod(s) onto '
-                                f'{r.get("nodeclaims")} new nodeclaim(s)'))
-
+            ev.append({"ts": ts, "kind": "DECIDE", "pod_count": r.get("pods"),
+                       "nodeclaim_count": r.get("nodeclaims")})
     for name, s in stories.items():
         if s.t_created:
-            entries.append((s.t_created,
-                f'{cyan("CREATE")}     nodeclaim {bold(name)} (nodepool {s.nodepool}, '
-                f'{s.candidate_count or "?"} candidate types)'))
+            ev.append({"ts": s.t_created, "kind": "CREATE", "nodeclaim": name,
+                       "nodepool": s.nodepool, "candidate_types": s.candidate_count})
         if s.t_launched:
-            price = ""
-            entries.append((s.t_launched,
-                f'{green("LAUNCH")}     {bold(name)} → {s.instance_type} '
-                f'({s.capacity_type}) in {s.zone}{price}'))
+            ev.append({"ts": s.t_launched, "kind": "LAUNCH", "nodeclaim": name,
+                       "instance_type": s.instance_type,
+                       "capacity_type": s.capacity_type, "zone": s.zone})
         if s.t_registered:
-            entries.append((s.t_registered,
-                f'{green("REGISTER")}   {name} joined as node {s.node}'))
+            ev.append({"ts": s.t_registered, "kind": "REGISTER", "nodeclaim": name,
+                       "node": s.node})
         if s.t_initialized:
-            entries.append((s.t_initialized, f'{green("READY")}      {name} initialized'))
+            ev.append({"ts": s.t_initialized, "kind": "READY", "nodeclaim": name})
         if s.disruption and s.disruption.get("ts"):
             d = s.disruption
-            sav = f', saves ${d["savings"]:.2f}/hr' if d.get("savings") is not None else ""
-            entries.append((d["ts"],
-                f'{magenta("DISRUPT")}    {bold(name)} via {d.get("reason") or "?"} '
-                f'({d.get("decision") or "?"}, {d.get("replacements", 0)} replacement(s){sav})'))
+            ev.append({"ts": d["ts"], "kind": "DISRUPT", "nodeclaim": name,
+                       "reason": d.get("reason"), "decision": d.get("decision"),
+                       "replacements": d.get("replacements", 0),
+                       "savings_per_hour": d.get("savings")})
         if s.t_deleted:
-            entries.append((s.t_deleted, f'{red("DELETE")}     nodeclaim {name} removed'))
+            ev.append({"ts": s.t_deleted, "kind": "DELETE", "nodeclaim": name})
+    ev.sort(key=lambda e: e["ts"])
+    return ev
 
-    entries.sort(key=lambda e: e[0])
+def _history_line(e):
+    k = e["kind"]
+    if k == "PENDING":
+        pods = e["pods"]
+        return (f'{yellow("PENDING")}    {len(pods)} unschedulable pod(s): '
+                f'{", ".join(pods[:4])}{" …" if len(pods) > 4 else ""}')
+    if k == "DECIDE":
+        return (f'{cyan("DECIDE")}     fit {e["pod_count"]} pod(s) onto '
+                f'{e["nodeclaim_count"]} new nodeclaim(s)')
+    if k == "CREATE":
+        return (f'{cyan("CREATE")}     nodeclaim {bold(e["nodeclaim"])} '
+                f'(nodepool {e["nodepool"]}, {e["candidate_types"] or "?"} candidate types)')
+    if k == "LAUNCH":
+        return (f'{green("LAUNCH")}     {bold(e["nodeclaim"])} → {e["instance_type"]} '
+                f'({e["capacity_type"]}) in {e["zone"]}')
+    if k == "REGISTER":
+        return f'{green("REGISTER")}   {e["nodeclaim"]} joined as node {e["node"]}'
+    if k == "READY":
+        return f'{green("READY")}      {e["nodeclaim"]} initialized'
+    if k == "DISRUPT":
+        sav = f', saves ${e["savings_per_hour"]:.2f}/hr' \
+            if e.get("savings_per_hour") is not None else ""
+        return (f'{magenta("DISRUPT")}    {bold(e["nodeclaim"])} via {e.get("reason") or "?"} '
+                f'({e.get("decision") or "?"}, {e.get("replacements", 0)} replacement(s){sav})')
+    if k == "DELETE":
+        return f'{red("DELETE")}     nodeclaim {e["nodeclaim"]} removed'
+    return k
+
+def cmd_history(store, args):
+    events = _history_events(store)
     if args.since:
         cutoff = datetime.now(timezone.utc) - timedelta(hours=args.since)
-        entries = [e for e in entries if e[0] >= cutoff]
-    if not entries:
+        events = [e for e in events if e["ts"] >= cutoff]
+
+    if args.json:
+        out = [{**{k: v for k, v in e.items() if k != "ts"},
+                "time": fmt_ts(e["ts"])} for e in events]
+        print(json.dumps(out, indent=2))
+        return
+    if not events:
         print("no history yet")
         return
     last_day = None
-    for ts, line in entries:
-        day = ts.strftime("%Y-%m-%d")
+    for e in events:
+        day = e["ts"].strftime("%Y-%m-%d")
         if day != last_day:
             print(bold(f"\n── {day} " + "─" * 40))
             last_day = day
-        print(f'{dim(ts.strftime("%H:%M:%S"))}  {line}')
+        print(f'{dim(e["ts"].strftime("%H:%M:%S"))}  {_history_line(e)}')
 
 def _tree(lines):
     """lines: list of (depth, text). Renders box-drawing tree."""
@@ -1000,6 +1089,10 @@ def _section_trigger(s):
             L.append((3, cyan(p)))
         if len(s.trigger_pods) > MAX_TRIGGER_PODS_SHOWN:
             L.append((3, dim(f'… and {len(s.trigger_pods) - MAX_TRIGGER_PODS_SHOWN} more')))
+        if s.trigger_reasons:
+            L.append((2, "why they did not fit (from kube-scheduler FailedScheduling events):"))
+            for reason, count in s.trigger_reasons:
+                L.append((3, f'{yellow(reason)} {dim(f"(x{count})")}'))
     elif s.nominated_pods:
         L.append((2, f'pods nominated to this node: {", ".join(s.nominated_pods[:MAX_POD_NAMES_SHOWN])}'))
     else:
@@ -1837,9 +1930,11 @@ def main():
 
     p = sub.add_parser("nodes", help="list karpenter nodes (live + historical)")
     p.add_argument("--live", action="store_true", help="only currently-running")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
 
     p = sub.add_parser("history", help="timeline of provisioning/disruption decisions")
     p.add_argument("--since", type=float, metavar="HOURS", help="only last N hours")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
 
     p = sub.add_parser("explain", help="decision trace for one node")
     p.add_argument("target", help="node name, nodeclaim name, or instance id")
