@@ -74,8 +74,21 @@ everything still works except prices and the funnel/plan/why-not catalog.
 ```bash
 git clone <this-repo> && cd karpenter-explain
 cp kexplain ~/.local/bin/        # or anywhere on PATH
-kexplain --help
+kexplain doctor                  # checks everything and tells you what to fix
 ```
+
+`doctor` verifies kubectl, cluster access, Karpenter, NodePools, debug
+logging, AWS access, and the local store, with a fix hint for anything
+broken. Regular commands run a fast preflight too, so a missing kubeconfig
+gets you a diagnosis instead of a stack trace.
+
+New to the tool? Just run `kexplain` with no arguments on a terminal: it
+drops you into an interactive wizard that walks through the common
+investigations (expensive node, missing type, cluster timeline, deployment
+planning) with numbered menus.
+
+Agents and scripts: see [AGENTS.md](AGENTS.md) for the non-interactive
+contract (`doctor --json`, exit codes, json surfaces, no-TTY rules).
 
 ## Five-minute tour
 
@@ -125,6 +138,8 @@ kexplain plan -f my-deployment.yaml
 | `kexplain explain <target> --json` | Machine-readable story |
 | `kexplain plan -f FILE` | Simulate the funnel for a Pod/Deployment/Job yaml before applying |
 | `kexplain sync` | Harvest only (see "Keeping history" below) |
+| `kexplain wizard` | Interactive guided investigation (also: bare `kexplain` on a TTY) |
+| `kexplain doctor [--json]` | Check prerequisites; exit 0 ready, 3 broken |
 
 Global flags: `--no-color`, `--no-sync` (skip harvesting). For `explain`:
 `--no-prices`, `--no-funnel`.
@@ -195,6 +210,8 @@ sleep 120 && kexplain history
 
 ```
 kexplain                 the tool, single-file python, stdlib only
+tests/                   unit tests (offline, fixture-based): python3 -m unittest discover tests
+AGENTS.md                contract for AI agents and scripts driving the tool
 infra/create-cluster.sh  demo cluster provisioning (eksctl + helm)
 infra/teardown.sh        full cleanup
 test/workloads.yaml      constraint-varied workloads to generate decisions

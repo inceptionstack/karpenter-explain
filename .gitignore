@@ -1,4 +1,4 @@
-# local harvest store lives in ~/.kexplain, never in-repo — but guard anyway
+# local harvest store lives in ~/.kexplain, never in-repo, but guard anyway
 .kexplain/
 *.jsonl
 ec2-catalog*.json

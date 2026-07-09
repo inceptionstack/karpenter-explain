@@ -84,6 +84,21 @@ def red(s):     return c("31", s)
 def cyan(s):    return c("36", s)
 def magenta(s): return c("35", s)
 
+def print_logo(subtitle=""):
+    """Small banner for interactive use. Skipped when piped."""
+    if not sys.stdout.isatty():
+        return
+    art = (
+        "  _              _     _\n"
+        " | | _____  ___| |__ (_)_ __\n"
+        " | |/ / _ \\/ __| '_ \\| | '_ \\\n"
+        " |   <  __/\\__ \\ |_) | | | | |\n"
+        " |_|\\_\\___||___/ .__/|_|_| |_|\n"
+        "               |_|"
+    )
+    print(cyan(art))
+    print(dim(f"  an EXPLAIN plan for Karpenter{('  |  ' + subtitle) if subtitle else ''}\n"))
+
 # ---------------------------------------------------------------- store
 
 class Store:
@@ -305,13 +320,14 @@ def build_stories(store):
             s.requests = r.get("requests")
             itypes = r.get("instance-types", "")
             if isinstance(itypes, str):
-                parts = [p.strip() for p in itypes.split(",")]
+                # format: "c3.2xlarge, c3.4xlarge, c3.8xlarge and 595 other(s)"
+                # note the last named type is glued to "and N other(s)"
                 extra = 0
-                m = re.search(r"and (\d+) other\(s\)", itypes)
+                m = re.search(r"\s+and (\d+) other\(s\)", itypes)
                 if m:
                     extra = int(m.group(1))
-                    parts = [p for p in parts if "other(s)" not in p]
-                s.candidate_types = [p for p in parts if p]
+                    itypes = itypes[:m.start()]
+                s.candidate_types = [p.strip() for p in itypes.split(",") if p.strip()]
                 s.candidate_count = len(s.candidate_types) + extra
             # attach the most recent provisioning session within 60s
             for sts, pods, _ in reversed(sessions):
@@ -1272,6 +1288,276 @@ def cmd_plan(store, args):
             print(dim(f'     … and {len(matches) - args.top} more'))
     print()
 
+# ------------------------------------------------- wizard
+
+def ask(prompt, options=None, default=None):
+    """Numbered-menu or free-text prompt. Ctrl-C/Ctrl-D exits cleanly."""
+    try:
+        if options:
+            print()
+            for i, (label, _) in enumerate(options, 1):
+                print(f'  {bold(str(i))}. {label}')
+            while True:
+                raw = input(f'\n{cyan(prompt)} [1-{len(options)}'
+                            f'{", q to quit" if True else ""}]: ').strip().lower()
+                if raw in ("q", "quit", "exit"):
+                    sys.exit(0)
+                if not raw and default is not None:
+                    return options[default][1]
+                if raw.isdigit() and 1 <= int(raw) <= len(options):
+                    return options[int(raw) - 1][1]
+                print(dim("  pick a number from the list, or q to quit"))
+        else:
+            raw = input(f'{cyan(prompt)}: ').strip()
+            if raw.lower() in ("q", "quit", "exit"):
+                sys.exit(0)
+            return raw
+    except (KeyboardInterrupt, EOFError):
+        print()
+        sys.exit(0)
+
+def pick_node(stories, live_only=False, prompt="Which node?"):
+    """Menu of known nodes, most recent first. Returns a NodeStory or None."""
+    live = live_nodeclaims()
+    items = sorted(stories.values(),
+                   key=lambda s: s.t_created or datetime.min.replace(tzinfo=timezone.utc),
+                   reverse=True)
+    if live_only:
+        items = [s for s in items if s.name in live]
+    if not items:
+        return None
+    opts = []
+    for s in items[:12]:
+        state = "RUNNING" if s.name in live else ("disrupted" if s.disruption else "gone")
+        detail = f'({s.instance_type or "?"}, {s.capacity_type or "?"}, {state})'
+        opts.append((f'{s.node or s.name}  {dim(detail)}', s))
+    return ask(prompt, opts)
+
+def cmd_wizard(store, args):
+    if not sys.stdin.isatty():
+        sys.exit("wizard needs an interactive terminal. Agents should use the "
+                 "direct commands instead: kexplain nodes/history/explain "
+                 "(see AGENTS.md)")
+
+    stories = build_stories(store)
+
+    while True:
+        goal = ask("What do you want to investigate?", [
+            ("Why did I get this specific node / instance type?", "why_node"),
+            ("Why did Karpenter pick an expensive / weird instance?", "expensive"),
+            ("Why was a type I expected NOT chosen?", "why_not"),
+            ("What happened in my cluster recently?", "history"),
+            ("What would a new deployment get? (before the fact)", "plan"),
+            ("Check my setup (doctor)", "doctor"),
+        ])
+
+        if goal == "why_node":
+            s = pick_node(stories)
+            if not s:
+                print(yellow("\nno karpenter nodes found yet. Deploy something "
+                             "unschedulable and re-run, or check kexplain doctor."))
+                continue
+            ns = argparse.Namespace(target=s.name, json=False, no_prices=False,
+                                    no_funnel=False, why_not=None)
+            cmd_explain(store, ns)
+
+        elif goal == "expensive":
+            s = pick_node(stories, prompt="Which node looks too expensive?")
+            if not s:
+                print(yellow("\nno karpenter nodes found yet."))
+                continue
+            print(dim("\nreading the trace top to bottom: CONSTRAINTS shows who "
+                      "narrowed the choice, FEATURE ATTRIBUTION shows whether "
+                      "premium features were asked for or just picked."))
+            ns = argparse.Namespace(target=s.name, json=False, no_prices=False,
+                                    no_funnel=False, why_not=None)
+            cmd_explain(store, ns)
+            follow = ask("Dig further?", [
+                ("Compare against a type you expected instead", "why_not"),
+                ("Back to the main menu", "menu"),
+            ], default=1)
+            if follow == "why_not":
+                t = ask("Which instance type did you expect (e.g. m6g.large)?")
+                if t:
+                    pool = store.objects("nodepools").get(s.nodepool or "")
+                    cmd_why_not(store, s, pool, t)
+
+        elif goal == "why_not":
+            s = pick_node(stories, prompt="For which node?")
+            if not s:
+                print(yellow("\nno karpenter nodes found yet."))
+                continue
+            t = ask("Which instance type should have been chosen (e.g. c5.large)?")
+            if t:
+                pool = store.objects("nodepools").get(s.nodepool or "")
+                cmd_why_not(store, s, pool, t)
+
+        elif goal == "history":
+            hours = ask("How far back? ", [
+                ("Last hour", 1.0), ("Last 24 hours", 24.0),
+                ("Last week", 168.0), ("Everything in the store", None),
+            ], default=1)
+            cmd_history(store, argparse.Namespace(since=hours))
+
+        elif goal == "plan":
+            path = ask("Path to your pod/deployment yaml")
+            if not path:
+                continue
+            if not os.path.exists(path):
+                print(red(f"  file not found: {path}"))
+                continue
+            cmd_plan(store, argparse.Namespace(file=path, top=10))
+
+        elif goal == "doctor":
+            try:
+                cmd_doctor(store, argparse.Namespace(json=False))
+            except SystemExit:
+                pass  # stay in the wizard
+
+        again = ask("\nAnything else?", [
+            ("Yes, back to the menu", True),
+            ("No, done", False),
+        ], default=0)
+        if not again:
+            print(dim("bye\n"))
+            return
+
+# ------------------------------------------------- doctor
+
+def preflight():
+    """Fast basic checks before any real command. Returns a problem string,
+    or None when good to go. Kept cheap: two kubectl calls, no AWS."""
+    try:
+        sh("kubectl config current-context", timeout=10)
+    except Exception:
+        return "no kubectl context (is kubectl installed and kubeconfig set?)"
+    try:
+        sh("kubectl get --raw /readyz", timeout=15)
+    except Exception:
+        return "cluster unreachable with current kubeconfig"
+    try:
+        pods = kubectl_json(f"get pods -n {KARPENTER_NS} "
+                            f"-l app.kubernetes.io/name=karpenter")["items"]
+        if not pods:
+            return (f"no karpenter pods in namespace {KARPENTER_NS} "
+                    f"(set KARPENTER_NAMESPACE if it runs elsewhere)")
+    except Exception:
+        return "cannot list pods (RBAC?)"
+    return None
+
+def cmd_doctor(store, args):
+    """Check every prerequisite and report what works, what doesn't, and how
+    to fix it. --json gives agents a machine-readable version."""
+    checks = []
+
+    def check(name, ok, detail, fix=None):
+        checks.append({"check": name, "ok": bool(ok), "detail": detail,
+                       **({"fix": fix} if fix and not ok else {})})
+
+    # kubectl present
+    try:
+        v = sh("kubectl version --client -o json", timeout=15)
+        check("kubectl", True, json.loads(v)["clientVersion"]["gitVersion"])
+    except Exception as ex:
+        check("kubectl", False, str(ex)[:120],
+              "install kubectl and put it on PATH")
+
+    # cluster reachable
+    cluster = None
+    try:
+        ctx = sh("kubectl config current-context", timeout=15).strip()
+        sh("kubectl get --raw /readyz", timeout=20)
+        cluster = current_cluster()
+        check("cluster access", True, f"context {ctx}")
+    except Exception as ex:
+        check("cluster access", False, str(ex)[:120],
+              "aws eks update-kubeconfig --name <cluster> --region <region>")
+
+    # karpenter installed, and is debug logging on
+    if cluster:
+        try:
+            pods = kubectl_json(f"get pods -n {KARPENTER_NS} "
+                                f"-l app.kubernetes.io/name=karpenter")["items"]
+            if pods:
+                ready = sum(1 for p in pods
+                            if all(c.get("ready") for c in
+                                   p.get("status", {}).get("containerStatuses", [])))
+                check("karpenter", ready > 0,
+                      f"{ready}/{len(pods)} controller pod(s) ready in {KARPENTER_NS}",
+                      "kubectl describe the karpenter pods; see README Requirements")
+            else:
+                check("karpenter", False, f"no karpenter pods in {KARPENTER_NS}",
+                      "export KARPENTER_NAMESPACE=<ns> if it runs elsewhere, "
+                      "or install karpenter (see infra/create-cluster.sh)")
+        except Exception as ex:
+            check("karpenter", False, str(ex)[:120])
+
+        try:
+            pools = kubectl_json("get nodepools")["items"]
+            check("nodepools", len(pools) > 0,
+                  f'{len(pools)} nodepool(s): '
+                  f'{", ".join(p["metadata"]["name"] for p in pools[:5])}' if pools
+                  else "none found",
+                  "apply a NodePool + EC2NodeClass; see infra/create-cluster.sh step 5")
+        except Exception as ex:
+            check("nodepools", False, str(ex)[:120],
+                  "karpenter CRDs missing? is karpenter v1.x installed?")
+
+        try:
+            logs = sh(f"kubectl logs -n {KARPENTER_NS} "
+                      f"-l app.kubernetes.io/name=karpenter --tail=200", timeout=30)
+            has_debug = '"DEBUG"' in logs
+            check("debug logging", has_debug,
+                  "DEBUG lines present" if has_debug else
+                  "no DEBUG lines in recent logs (candidate lists will be missing)",
+                  "helm upgrade karpenter ... --set logLevel=debug")
+        except Exception:
+            pass
+
+    # aws cli + read-only EC2 access (optional but recommended)
+    try:
+        sh("aws sts get-caller-identity", timeout=20)
+        try:
+            sh("aws ec2 describe-instance-types --max-items 1", timeout=30)
+            check("aws ec2 access", True,
+                  "DescribeInstanceTypes works (prices, funnel, plan, why-not enabled)")
+        except Exception:
+            check("aws ec2 access", False,
+                  "credentials exist but ec2:DescribeInstanceTypes denied",
+                  "grant read-only EC2 describe permissions; tool still works without")
+    except Exception:
+        check("aws ec2 access", False, "no aws credentials",
+              "optional: configure aws CLI for prices/funnel/plan/why-not")
+
+    # store writable
+    try:
+        if cluster:
+            s = Store(cluster)
+            probe = os.path.join(s.dir, ".probe")
+            open(probe, "w").close()
+            os.remove(probe)
+            check("local store", True, s.dir)
+    except Exception as ex:
+        check("local store", False, str(ex)[:120],
+              "set KEXPLAIN_STORE to a writable directory")
+
+    optional = ("aws ec2 access", "debug logging")
+    ok = all(c["ok"] for c in checks if c["check"] not in optional)
+    if args.json:
+        print(json.dumps({"ok": ok, "checks": checks}, indent=2))
+    else:
+        print()
+        for c in checks:
+            mark = green("✓") if c["ok"] else \
+                   (yellow("!") if c["check"] in optional else red("✗"))
+            print(f'  {mark} {bold(c["check"].ljust(16))} {c["detail"]}')
+            if not c["ok"] and c.get("fix"):
+                print(f'      {dim("fix: " + c["fix"])}')
+        print()
+        print(green("ready to explain") if ok else
+              red("fix the failing checks above (aws / debug-logging are optional)"))
+    sys.exit(0 if ok else 3)
+
 # ---------------------------------------------------------------- main
 
 def main():
@@ -1281,7 +1567,7 @@ def main():
     ap.add_argument("--no-color", action="store_true")
     ap.add_argument("--no-sync", action="store_true",
                     help="skip harvesting cluster state before running")
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub = ap.add_subparsers(dest="cmd")
 
     sub.add_parser("sync", help="harvest logs/events/objects into local store")
 
@@ -1303,16 +1589,49 @@ def main():
     p.add_argument("-f", "--file", required=True, help="pod/deployment yaml or json")
     p.add_argument("--top", type=int, default=10)
 
+    p = sub.add_parser("doctor", help="check prerequisites and cluster readiness")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+
+    sub.add_parser("wizard", help="interactive guided investigation")
+
     args = ap.parse_args()
     if args.no_color:
         USE_COLOR = False
 
+    # bare `kexplain` on a terminal drops into the wizard; otherwise show help
+    if not args.cmd:
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            args.cmd = "wizard"
+        else:
+            ap.print_help()
+            sys.exit(1)
+
+    # doctor must run even with no kubeconfig at all
+    if args.cmd == "doctor":
+        print_logo("doctor")
+        cmd_doctor(None, args)
+        return
+
+    # preflight: if the basics are broken, fall through to doctor instead of
+    # failing with a stack trace mid-command
+    problem = preflight()
+    if problem:
+        print(red(f"\n  preflight failed: {problem}"))
+        print(dim("  running kexplain doctor for the full picture:\n"))
+        cmd_doctor(None, argparse.Namespace(json=False))
+        return  # doctor sys.exits with its own code
+
+    print_logo(args.cmd if args.cmd != "wizard" else "interactive investigation")
     store = Store(current_cluster())
-    if args.cmd != "sync" and not args.no_sync:
+    if args.cmd not in ("sync",) and not args.no_sync:
         try:
             sync(store, quiet=True)
         except Exception as ex:
             print(dim(f"  (sync skipped: {ex})"), file=sys.stderr)
+
+    if args.cmd == "wizard":
+        cmd_wizard(store, args)
+        return
 
     {"sync": cmd_sync, "nodes": cmd_nodes, "history": cmd_history,
      "explain": cmd_explain, "plan": cmd_plan}[args.cmd](store, args)
