@@ -5,6 +5,12 @@ answers "why did the database run my query this way?". It works after the
 fact, and before it.
 
 ```
+▌       ▜   ▘
+▙▘█▌▚▘▛▌▐ ▀▌▌▛▌
+▛▖▙▖▞▖▙▌▐▖█▌▌▌▌
+      ▌
+  an EXPLAIN plan for Karpenter
+
 $ kexplain explain ip-192-168-43-145.ec2.internal
 
 NODE ip-192-168-43-145.ec2.internal  nodeclaim=default-8bk6c  [RUNNING]
@@ -30,44 +36,6 @@ NODE ip-192-168-43-145.ec2.internal  nodeclaim=default-8bk6c  [RUNNING]
 └─ DISRUPTION
    └─ @ 10:01:56Z: disrupted via Underutilized → replace (saves $0.23/hr)
 ```
-
-Karpenter's reasoning is scattered across controller logs that rotate away,
-NodeClaims that get deleted with their nodes, and events that expire after an
-hour. kexplain saves all three into a local store every time you run it, so
-you can still explain a node that was consolidated away days ago.
-
-## Why you might want this
-
-- "Why do I keep getting expensive NVMe / high-network / latest-gen
-  instances?" The FEATURE ATTRIBUTION section tells you whether a premium
-  feature was actually required by your constraints, or whether CreateFleet
-  just picked it. It also tells you how to block it.
-- "Why wasn't the cheap type picked?" Run `--why-not <type>` and you get
-  every rule that eliminated it. If nothing eliminated it, you get the
-  CreateFleet-level reason (price or spot pool depth) instead.
-- "What just happened in my cluster?" `history` is a running timeline of
-  every provisioning and consolidation decision, including the $/hr savings
-  Karpenter calculated.
-- "What will this deployment get?" `plan` simulates the funnel for a pod
-  spec before you apply it.
-
-## Requirements
-
-| What | Why | Required? |
-|---|---|---|
-| kubectl + kubeconfig for the cluster | reads logs, NodeClaims, events | yes |
-| Python 3.8+ (stdlib only, nothing to pip install) | runs the tool | yes |
-| aws CLI with read-only EC2 access | spot prices, funnel, plan, why-not | recommended |
-| Karpenter v1.x in kube-system | the thing being explained | yes |
-
-Works best with Karpenter's helm chart set to `logLevel: debug`, which logs
-the candidate lists. `info` works too, you just lose candidate details.
-
-If Karpenter runs in a different namespace: `export KARPENTER_NAMESPACE=<ns>`.
-
-The AWS calls are `ec2:DescribeInstanceTypes` and
-`ec2:DescribeSpotPriceHistory`, both read-only. Without AWS credentials
-everything still works except prices and the funnel/plan/why-not catalog.
 
 ## Install
 
@@ -110,6 +78,76 @@ planning) with numbered menus.
 
 Agents and scripts: see [AGENTS.md](AGENTS.md) for the non-interactive
 contract (`doctor --json`, exit codes, json surfaces, no-TTY rules).
+
+## Or: let your AI agent set it up
+
+Using Claude Code or another coding agent? Paste this prompt and you are done:
+
+```text
+Set up the kexplain tool from https://github.com/inceptionstack/karpenter-explain
+and smoke test it against my cluster.
+
+1. Read AGENTS.md in that repo first, it is the guide for agents.
+2. Install kexplain onto my PATH (pipx install from the repo url works).
+3. Connect kubectl to my EKS cluster: <CLUSTER-NAME> in <REGION>.
+   (Skip this if kubectl already points at the right cluster.)
+4. Run `kexplain doctor --json` and fix anything it flags, using the fix
+   hints in its output. Two checks are optional: aws ec2 access and debug
+   logging. Tell me if either is missing and what I lose without it.
+5. Smoke test: run `kexplain --no-color nodes` and
+   `kexplain --no-color history --since 24`. If there are any nodes, pick
+   one and run `kexplain --no-color explain <that-node>`.
+6. Report back: doctor result, how many Karpenter nodes you found, and a
+   short summary of the most recent provisioning or consolidation decision.
+
+Do not create, modify, or delete anything in the cluster or in AWS. kexplain
+itself is read-only; your job is only to install, verify, and report.
+```
+
+Replace `<CLUSTER-NAME>` and `<REGION>`. If Karpenter runs outside
+`kube-system`, add that to the prompt (`export KARPENTER_NAMESPACE=<ns>`).
+
+This exact flow has been tested end to end: a fresh agent on a clean machine,
+given only this repo, produced a green setup and a correct explain trace on
+its first try.
+
+## Why you might want this
+
+Karpenter's reasoning is scattered across controller logs that rotate away,
+NodeClaims that get deleted with their nodes, and events that expire after an
+hour. kexplain saves all three into a local store every time you run it, so
+you can still explain a node that was consolidated away days ago.
+
+- "Why do I keep getting expensive NVMe / high-network / latest-gen
+  instances?" The FEATURE ATTRIBUTION section tells you whether a premium
+  feature was actually required by your constraints, or whether CreateFleet
+  just picked it. It also tells you how to block it.
+- "Why wasn't the cheap type picked?" Run `--why-not <type>` and you get
+  every rule that eliminated it. If nothing eliminated it, you get the
+  CreateFleet-level reason (price or spot pool depth) instead.
+- "What just happened in my cluster?" `history` is a running timeline of
+  every provisioning and consolidation decision, including the $/hr savings
+  Karpenter calculated.
+- "What will this deployment get?" `plan` simulates the funnel for a pod
+  spec before you apply it.
+
+## Requirements
+
+| What | Why | Required? |
+|---|---|---|
+| kubectl + kubeconfig for the cluster | reads logs, NodeClaims, events | yes |
+| Python 3.8+ (stdlib only, nothing to pip install) | runs the tool | yes |
+| aws CLI with read-only EC2 access | spot prices, funnel, plan, why-not | recommended |
+| Karpenter v1.x in kube-system | the thing being explained | yes |
+
+Works best with Karpenter's helm chart set to `logLevel: debug`, which logs
+the candidate lists. `info` works too, you just lose candidate details.
+
+If Karpenter runs in a different namespace: `export KARPENTER_NAMESPACE=<ns>`.
+
+The AWS calls are `ec2:DescribeInstanceTypes` and
+`ec2:DescribeSpotPriceHistory`, both read-only. Without AWS credentials
+everything still works except prices and the funnel/plan/why-not catalog.
 
 ## Five-minute tour
 

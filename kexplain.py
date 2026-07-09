@@ -89,12 +89,10 @@ def print_logo(subtitle=""):
     if not sys.stdout.isatty():
         return
     art = (
-        "  _              _     _\n"
-        " | | _____  ___| |__ (_)_ __\n"
-        " | |/ / _ \\/ __| '_ \\| | '_ \\\n"
-        " |   <  __/\\__ \\ |_) | | | | |\n"
-        " |_|\\_\\___||___/ .__/|_|_| |_|\n"
-        "               |_|"
+        "▌       ▜   ▘\n"
+        "▙▘█▌▚▘▛▌▐ ▀▌▌▛▌\n"
+        "▛▖▙▖▞▖▙▌▐▖█▌▌▌▌\n"
+        "      ▌"
     )
     print(cyan(art))
     print(dim(f"  an EXPLAIN plan for Karpenter{('  |  ' + subtitle) if subtitle else ''}\n"))
